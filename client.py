@@ -3,16 +3,18 @@
 Run: python client.py <server-ip> [port]      e.g. python client.py 192.168.1.20
 """
 import ctypes
+import argparse
 import queue
 import sys
+import threading
 import time
 import tkinter as tk
 from tkinter import messagebox
 
 from chat_core import ChatCore
+from protocol import validate_server_event
 
-HOST = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
-PORT = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
+HOST, PORT = "127.0.0.1", 5000
 
 # Sharp text on scaled Windows displays (else Windows bitmap-stretches the window).
 # Fonts are in points so they scale by themselves; pixel sizes go through px().
@@ -64,6 +66,62 @@ def avatar(parent, name, size=28):
     return c
 
 
+class ScrollList(tk.Frame):
+    """A bounded list whose wheel and navigation bindings stay local to it."""
+    def __init__(self, parent):
+        super().__init__(parent, bg=PANEL)
+        self.canvas = tk.Canvas(self, bg=PANEL, highlightthickness=0, takefocus=1)
+        self.vertical = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        horizontal = tk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=self.vertical.set, xscrollcommand=horizontal.set)
+        self.vertical.pack(side="right", fill="y")
+        horizontal.pack(side="bottom", fill="x")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.content = tk.Frame(self.canvas, bg=PANEL)
+        self.window = self.canvas.create_window(0, 0, anchor="nw", window=self.content)
+        self.content.bind("<Configure>", self._layout)
+        self.canvas.bind("<Configure>", self._layout)
+        self.bind_controls(self.canvas)
+        self.bind_controls(self.content)
+
+    def _layout(self, _event=None):
+        self.canvas.itemconfigure(self.window, width=max(self.canvas.winfo_width(), self.content.winfo_reqwidth()))
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def bind_controls(self, widget):
+        widget.bind("<MouseWheel>", self._wheel, add="+")
+        widget.bind("<Button-4>", lambda e: self._scroll(-1), add="+")
+        widget.bind("<Button-5>", lambda e: self._scroll(1), add="+")
+        for key, amount, unit in (("Up", -1, "units"), ("Down", 1, "units"),
+                                  ("Prior", -1, "pages"), ("Next", 1, "pages")):
+            widget.bind("<" + key + ">", lambda e, a=amount, u=unit: self._scroll(a, u), add="+")
+        widget.bind("<FocusIn>", self._focus_visible, add="+")
+        for child in widget.winfo_children():
+            self.bind_controls(child)
+
+    def _scroll(self, amount, unit="units"):
+        self.canvas.yview_scroll(amount, unit)
+        return "break"
+
+    def _wheel(self, event):
+        return self._scroll(-max(1, abs(event.delta) // 120) if event.delta > 0
+                            else max(1, abs(event.delta) // 120))
+
+    def _focus_visible(self, event):
+        widget = event.widget
+        if widget in (self.canvas, self.content):
+            return
+        top = widget.winfo_rooty() - self.content.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        visible_top = self.canvas.canvasy(0)
+        height = self.canvas.winfo_height()
+        total = max(self.content.winfo_height(), 1)
+        if top < visible_top:
+            self.canvas.yview_moveto(top / total)
+        elif bottom > visible_top + height:
+            self.canvas.yview_moveto((bottom - height) / total)
+
+
 class ChatClient:
     def __init__(self, root):
         self.root = root
@@ -72,11 +130,17 @@ class ChatClient:
         root.geometry(f"{px(1100)}x{px(680)}")
         root.minsize(px(820), px(520))
         self.core = ChatCore(HOST, PORT)
+        self.closed = False
+        self.login_worker = None
+        self.login_results = queue.Queue()
+        self.login_job = self.poll_job = None
+        root.protocol("WM_DELETE_WINDOW", self.close)
 
         self.users = []
         self.groups = {}
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
+        self.drafts = {}  # exact composer text keyed by room identity
         self.active = None
         self.want = None  # group we created/joined: open it once the server confirms membership
         self.flash_job = None
@@ -102,14 +166,41 @@ class ChatClient:
         self.name_entry.focus_set()
         self.login_error = label(card, "", 10, ERROR)
         self.login_error.pack(anchor="w", pady=(px(6), 0))
-        button(card, "Join server", self.login, primary=True).pack(fill="x", pady=(px(8), 0))
+        self.login_button = button(card, "Join server", self.login, primary=True)
+        self.login_button.pack(fill="x", pady=(px(8), 0))
 
     def login(self, _event=None):
+        if self.closed or self.login_worker is not None:
+            return
         name = self.name_entry.get().strip()
         if not name:
             self.login_error.config(text="Enter a name first.")
             return
-        ok, result = self.core.login(name)
+        self.login_error.config(text="")
+        self.login_button.config(state="disabled")
+        self.name_entry.config(state="disabled")
+
+        def attempt():
+            # Only the Tk thread touches widgets, including on failure or close.
+            self.login_results.put(self.core.login(name))
+
+        self.login_worker = threading.Thread(target=attempt, daemon=True)
+        self.login_worker.start()
+        self.login_job = self.root.after(25, self.poll_login)
+
+    def poll_login(self):
+        self.login_job = None
+        if self.closed:
+            return
+        try:
+            ok, result = self.login_results.get_nowait()
+        except queue.Empty:
+            self.login_job = self.root.after(25, self.poll_login)
+            return
+        self.login_worker.join(timeout=1)
+        self.login_worker = None
+        self.login_button.config(state="normal")
+        self.name_entry.config(state="normal")
         if not ok:
             self.login_error.config(text=result)
             return
@@ -120,6 +211,18 @@ class ChatClient:
         self.core.start(self.inbox.put)
         self.poll()
 
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        for job in (self.login_job, self.poll_job, self.flash_job):
+            if job is not None:
+                self.root.after_cancel(job)
+        self.core.close()
+        if self.login_worker is not None:
+            self.login_worker.join(timeout=1)
+        self.root.destroy()
+
     # ---------- UI ----------
     def build_ui(self):
         main = tk.Frame(self.root, bg=BG)
@@ -129,16 +232,6 @@ class ChatClient:
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
         label(side, "Campfire", 14, bold=True).pack(anchor="w", padx=px(6))
-        head = tk.Frame(side, bg=PANEL)
-        head.pack(fill="x", pady=(px(20), px(4)))
-        label(head, "GROUPS", 9, MUTED, bold=True).pack(side="left", padx=px(6))
-        button(head, "+", self.create_group, bg=PANEL, padx=10, pady=0).pack(side="right")
-        self.group_box = tk.Frame(side, bg=PANEL)
-        self.group_box.pack(fill="x")
-        self.online_label = label(side, "ONLINE", 9, MUTED, bold=True)
-        self.online_label.pack(anchor="w", padx=px(6), pady=(px(20), px(4)))
-        self.user_box = tk.Frame(side, bg=PANEL)  # online users (R4)
-        self.user_box.pack(fill="x")
         me = tk.Frame(side, bg=BG, padx=px(10), pady=px(10))
         me.pack(side="bottom", fill="x")
         avatar(me, self.name, 32).pack(side="left")
@@ -146,6 +239,23 @@ class ChatClient:
         info.pack(side="left", padx=px(10))
         label(info, self.name, 10, bold=True).pack(anchor="w")
         label(info, "Connected", 9, ONLINE).pack(anchor="w")
+        lists = tk.Frame(side, bg=PANEL)
+        lists.pack(fill="both", expand=True)
+        lists.grid_rowconfigure(1, weight=1, uniform="lists")
+        lists.grid_rowconfigure(3, weight=1, uniform="lists")
+        lists.grid_columnconfigure(0, weight=1)
+        head = tk.Frame(lists, bg=PANEL)
+        head.grid(row=0, column=0, sticky="ew", pady=(px(20), px(4)))
+        label(head, "GROUPS", 9, MUTED, bold=True).pack(side="left", padx=px(6))
+        button(head, "+", self.create_group, bg=PANEL, padx=10, pady=0).pack(side="right")
+        self.group_list = ScrollList(lists)
+        self.group_list.grid(row=1, column=0, sticky="nsew")
+        self.group_box = self.group_list.content
+        self.online_label = label(lists, "ONLINE", 9, MUTED, bold=True)
+        self.online_label.grid(row=2, column=0, sticky="w", padx=px(6), pady=(px(20), px(4)))
+        self.user_list = ScrollList(lists)
+        self.user_list.grid(row=3, column=0, sticky="nsew")
+        self.user_box = self.user_list.content  # online users (R4)
 
         self.center = tk.Frame(main, bg=PANEL)
         self.center.pack(side="left", fill="both", expand=True, padx=(px(8), 0))
@@ -158,6 +268,7 @@ class ChatClient:
         self.title.pack(anchor="w")
         self.subtitle = label(header, "", 9, DIM)
         self.subtitle.pack(anchor="w")
+        self.join_button = button(header, "Join group", self.join_selected, primary=True)
         tk.Frame(self.center, bg=RAISED, height=px(1)).pack(fill="x")
         self.error_bar = tk.Label(self.center, bg="#3A2320", fg=ERROR, font=(FONT, 10),
                                   padx=px(24), pady=px(8), anchor="w")
@@ -166,11 +277,14 @@ class ChatClient:
         self.entry = entry(composer)  # chat box (R6)
         self.entry.pack(side="left", fill="x", expand=True, ipady=px(10))
         self.entry.bind("<Return>", self.send_text)
-        button(composer, "Send", self.send_text, primary=True).pack(side="right", padx=(px(10), 0))
+        self.send_button = button(composer, "Send", self.send_text, primary=True)
+        self.send_button.pack(side="right", padx=(px(10), 0))
         self.stage = tk.Frame(self.center, bg=PANEL)
         self.stage.pack(fill="both", expand=True)
         self.empty = label(self.stage, "Pick a group or someone online to start chatting.", 11, MUTED)
         self.empty.place(relwidth=1, relheight=1)
+        self.preview = label(self.stage, "Group preview · Join to see messages and chat.", 11, MUTED)
+        self.preview.place(relwidth=1, relheight=1)
         self.select(None)
 
     def open_room(self, key):
@@ -181,7 +295,9 @@ class ChatClient:
             box.tag_config("body", foreground="#DCDAD5", spacing3=px(12))
             box.place(relwidth=1, relheight=1)
             self.rooms[key] = box
-            self.rooms.get(self.active, self.empty).tkraise()  # a new window stacks on top; keep the active one visible
+            visible = (self.preview if self.active and self.active[0] == "group"
+                       and not self.can_send(self.active) else self.rooms.get(self.active, self.empty))
+            visible.tkraise()  # a new window stacks on top; keep the active view visible
         return self.rooms[key]
 
     def show(self, key, sender, text):
@@ -196,24 +312,49 @@ class ChatClient:
             self.unread[key] = self.unread.get(key, 0) + 1
             self.render_sidebar()
 
+    def can_send(self, key):
+        if not key:
+            return False
+        kind, name = key
+        return kind == "pm" or (kind == "group" and self.name in self.groups.get(name, []))
+
     def select(self, key):
+        if key and key[0] == "group" and key[1] not in self.groups:
+            key = None
+        if self.active is not None:
+            self.drafts[self.active] = self.entry.get()
         self.active = key
-        self.unread.pop(key, None)
+        self.join_button.pack_forget()
+        allowed = self.can_send(key)
+        self.entry.config(state="normal")
+        self.entry.delete(0, "end")
+        if key is not None:
+            self.entry.insert(0, self.drafts.get(key, ""))
+        self.entry.config(state="normal" if allowed else "disabled")
+        self.send_button.config(state="normal" if allowed else "disabled")
         if key is None:
             self.title.config(text=f"Welcome, {self.name}")
             self.subtitle.config(text="Groups and people online are on the left.")
             self.empty.tkraise()
-            self.entry.config(state="disabled")
         else:
             kind, name = key
-            self.open_room(key).tkraise()
             self.title.config(text=("#  " if kind == "group" else "@  ") + name)
-            self.subtitle.config(text="Only members see these messages" if kind == "group"
-                                 else f"Private: only you and {name} see this")
-            self.entry.config(state="normal")
-            self.entry.focus_set()
+            if kind == "group" and not allowed:
+                self.subtitle.config(text="Public membership preview · You have not joined")
+                self.preview.tkraise()
+                self.join_button.pack(anchor="w", pady=(px(6), 0))
+            else:
+                self.unread.pop(key, None)
+                self.open_room(key).tkraise()
+                self.subtitle.config(text="Only members see these messages" if kind == "group"
+                                     else f"Private: only you and {name} see this")
+                self.entry.focus_set()
         self.render_sidebar()
         self.render_members()
+
+    def join_selected(self):
+        if self.active and self.active[0] == "group":
+            self.join_group(self.active[1])
 
     def row(self, parent, text, command, key=None, badge="", person=None):
         n = self.unread.get(key)
@@ -239,16 +380,19 @@ class ChatClient:
             if self.name in members:
                 self.row(self.group_box, "#  " + g, lambda k=key: self.select(k), key, str(len(members)))
             else:
-                self.row(self.group_box, "#  " + g, lambda g=g: self.join_group(g), badge="Join")
+                self.row(self.group_box, "#  " + g, lambda k=key: self.select(k), key, badge="Preview")
         if not self.groups:
             label(self.group_box, "No groups yet. Press + to start one.", 9, DIM).pack(anchor="w", padx=px(6))
         self.online_label.config(text=f"ONLINE · {len(self.users)}")
-        others = [u for u in self.users if u != self.name]
-        for u in others:
+        for u in self.users:
             key = ("pm", u)
-            self.row(self.user_box, u, lambda k=key: self.select(k), key, person=u)
-        if not others:
-            label(self.user_box, "No one else is online yet.", 9, DIM).pack(anchor="w", padx=px(6))
+            display_name = u + " (you)" if u == self.name else u
+            self.row(self.user_box, display_name, lambda k=key: self.select(k), key, person=u)
+        if not self.users:
+            label(self.user_box, "No one is online yet.", 9, DIM).pack(anchor="w", padx=px(6))
+        for area in (self.group_list, self.user_list):
+            for child in area.content.winfo_children():
+                area.bind_controls(child)
 
     def render_members(self):
         for w in self.members_panel.winfo_children():
@@ -258,11 +402,14 @@ class ChatClient:
             return
         members = self.groups[self.active[1]]
         label(self.members_panel, f"MEMBERS · {len(members)}", 9, MUTED, bold=True).pack(anchor="w", pady=(0, px(8)))
+        self.member_list = ScrollList(self.members_panel)
+        self.member_list.pack(fill="both", expand=True)
         for m in members:
-            r = tk.Frame(self.members_panel, bg=PANEL, pady=px(5))
+            r = tk.Frame(self.member_list.content, bg=PANEL, pady=px(5))
             r.pack(fill="x")
             avatar(r, m).pack(side="left", padx=(0, px(10)))
             label(r, m + (" (you)" if m == self.name else ""), 10).pack(side="left")
+            self.member_list.bind_controls(r)
         self.members_panel.pack(side="right", fill="y", padx=(px(8), 0), before=self.center)
 
     def flash(self, text):
@@ -274,6 +421,8 @@ class ChatClient:
 
     # ---------- user actions ----------
     def join_group(self, g):
+        if g not in self.groups or self.name in self.groups[g]:
+            return
         self.want = ("group", g)
         self.core.join_group(g)  # room opens when server confirms membership
 
@@ -307,22 +456,33 @@ class ChatClient:
 
     def send_text(self, _event=None):
         text = self.entry.get().strip()
-        if not text or not self.active:
+        if not text or not self.can_send(self.active):
             return
         kind, name = self.active
         if kind == "pm":
-            self.core.pm(name, text)
+            sent = self.core.pm(name, text)
         else:
-            self.core.group_msg(name, text)
-        self.entry.delete(0, "end")  # no local echo: the server sends our message back, proving delivery
+            sent = self.core.group_msg(name, text)
+        if sent:
+            self.entry.delete(0, "end")
+            self.drafts[self.active] = ""  # the server echo is the only displayed message
 
     # ---------- network events (queued by ChatCore's thread) ----------
     def poll(self):
+        if self.closed:
+            return
         while not self.inbox.empty():
             self.handle(self.inbox.get())
-        self.root.after(100, self.poll)
+            if self.closed:
+                return
+        self.poll_job = self.root.after(100, self.poll)
 
     def handle(self, msg):
+        try:
+            msg = validate_server_event(msg)
+        except ValueError as exc:
+            self.flash(f"Invalid server event: {exc}")
+            return
         kind = msg["type"]
         if kind == "users":  # R4
             self.users = msg["users"]
@@ -336,22 +496,40 @@ class ChatClient:
                 key, self.want = self.want, None
                 self.select(key)
             else:
-                self.render_sidebar()
-                self.render_members()
+                if self.active and self.active[0] == "group" and self.active[1] not in self.groups:
+                    if self.want == self.active:
+                        self.want = None
+                    self.select(None)
+                elif self.active and self.active[0] == "group":
+                    self.select(self.active)
+                else:
+                    self.render_sidebar()
+                    self.render_members()
         elif kind == "pm":
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
         elif kind == "group_msg":
-            self.show(("group", msg["group"]), msg["from"], msg["text"])
+            if self.can_send(("group", msg["group"])):
+                self.show(("group", msg["group"]), msg["from"], msg["text"])
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])
         elif kind == "disconnected":
             messagebox.showerror("Disconnected", "Lost connection to the server")
-            self.root.destroy()
+            self.close()
 
 
-if __name__ == "__main__":
+def main(argv: list[str] | None = None) -> None:
+    global HOST, PORT
+    parser = argparse.ArgumentParser(description="Campfire socket chat client")
+    parser.add_argument("host", nargs="?", default="127.0.0.1")
+    parser.add_argument("port", nargs="?", type=int, default=5000)
+    args = parser.parse_args(argv)
+    HOST, PORT = args.host, args.port
     root = tk.Tk()
     ChatClient(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
