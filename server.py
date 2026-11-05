@@ -3,12 +3,15 @@
 Run: python server.py
 """
 import json
+import logging
+import os
 import queue
 import socket
+import sys
 import threading
 import time
 
-from protocol import (FrameReader, encode_frame, validate_client_message,
+from protocol import (FrameReader, enable_keepalive, encode_frame, validate_client_message,
                       MAX_SESSIONS, MAX_GROUPS, OUTBOUND_QUEUE_FRAMES, LOGIN_TIMEOUT)
 
 HOST, PORT = "0.0.0.0", 5000  # 0.0.0.0 = accept connections from other computers on the LAN
@@ -113,6 +116,8 @@ def disconnect_sessions(pending):
         except OSError:
             pass
         session.conn.close()
+        if name is not None:
+            logging.info("%s disconnected", name)
 
 
 def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TIMEOUT):
@@ -120,6 +125,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
     deadline = (time.monotonic() if accepted_at is None else accepted_at) + login_timeout
     reader = FrameReader(conn)
     try:
+        enable_keepalive(conn)
         while not session.closed.is_set():
             line = reader.readline(deadline if session.name is None else None)
             if not line:
@@ -135,6 +141,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                 disconnect_sessions(failed)
                 continue
             kind = msg["type"]
+            was_anonymous = session.name is None
             with lock:
                 if session.closed.is_set():
                     break
@@ -145,7 +152,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     new = msg["name"].strip() if kind == "login" else ""
                     if kind != "login" or not new:
                         send(session, {"type": "error", "text": "Please log in with a name"}, failed)
-                    elif new in clients:  # R3: unique names
+                    elif new.casefold() in map(str.casefold, clients):  # R3: unique names
                         send(session, {"type": "error", "text": f"Name '{new}' is already taken"}, failed)
                     elif not state_fits(list(clients) + [new], groups):
                         send(session, {"type": "error", "text": "State limit reached"}, failed)
@@ -209,6 +216,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                 else:
                     send(session, {"type": "error", "text": "Already logged in"}, failed)
             disconnect_sessions(failed)
+            if was_anonymous and session.name:  # outside the lock: a paused console must not freeze the server
+                logging.info("%s connected from %s:%s", session.name, addr[0], addr[1])
     except (OSError, ValueError, RecursionError):
         pass  # connection dropped or bad data: treat as disconnect
     finally:
@@ -250,6 +259,9 @@ def serve(listener, stop=None, *, max_sessions=MAX_SESSIONS,
                 conn, addr = listener.accept()
             except TimeoutError:
                 continue
+            except OSError:  # a client vanished mid-connect: others must keep working
+                time.sleep(.1)
+                continue
             accepted_at = time.monotonic()
             conn.settimeout(None)
             with active_lock:
@@ -277,11 +289,18 @@ def serve(listener, stop=None, *, max_sessions=MAX_SESSIONS,
 
 
 def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # IPv4 + TCP
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
+    if os.name != "nt":  # on Windows this option lets two servers share one port with no error
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind((HOST, port))
     srv.listen()
-    print(f"Server listening on port {PORT}. LAN IP (guess): {socket.gethostbyname(socket.gethostname())}")
+    try:
+        ip = socket.gethostbyname(socket.gethostname())
+    except OSError:
+        ip = "unknown, check ipconfig or ifconfig"
+    print(f"Server listening on port {port}. LAN IP (guess): {ip}")
     try:
         serve(srv)
     except KeyboardInterrupt:

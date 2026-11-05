@@ -5,7 +5,6 @@ Run: python client.py <server-ip> [port]      e.g. python client.py 192.168.1.20
 import ctypes
 import argparse
 import queue
-import sys
 import threading
 import time
 import tkinter as tk
@@ -144,6 +143,7 @@ class ChatClient:
         self.active = None
         self.want = None  # group we created/joined: open it once the server confirms membership
         self.flash_job = None
+        self.sidebar_pending = False
         self.inbox = queue.Queue()  # network thread -> GUI thread (Tkinter is not thread-safe)
         self.build_login()
 
@@ -164,7 +164,7 @@ class ChatClient:
         self.name_entry.pack(fill="x", ipady=px(8))
         self.name_entry.bind("<Return>", self.login)
         self.name_entry.focus_set()
-        self.login_error = label(card, "", 10, ERROR)
+        self.login_error = label(card, "", 10, ERROR, wraplength=px(350), justify="left")
         self.login_error.pack(anchor="w", pady=(px(6), 0))
         self.login_button = button(card, "Join server", self.login, primary=True)
         self.login_button.pack(fill="x", pady=(px(8), 0))
@@ -305,12 +305,18 @@ class ChatClient:
         tag = "name:" + sender
         box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
         box.configure(state="normal")
-        box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
+        box.insert("end", sender, (tag,), "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
         box.configure(state="disabled")
         box.see("end")
         if key != self.active:
             self.unread[key] = self.unread.get(key, 0) + 1
-            self.render_sidebar()
+            if not self.sidebar_pending:
+                self.sidebar_pending = True
+                self.root.after_idle(self.flush_sidebar)
+
+    def flush_sidebar(self):
+        self.sidebar_pending = False
+        self.render_sidebar()
 
     def can_send(self, key):
         if not key:
@@ -388,6 +394,9 @@ class ChatClient:
             key = ("pm", u)
             display_name = u + " (you)" if u == self.name else u
             self.row(self.user_box, display_name, lambda k=key: self.select(k), key, person=u)
+        for kind, u in self.rooms:
+            if kind == "pm" and u not in self.users:
+                self.row(self.user_box, u, lambda k=("pm", u): self.select(k), ("pm", u), "offline", u)
         if not self.users:
             label(self.user_box, "No one is online yet.", 9, DIM).pack(anchor="w", padx=px(6))
         for area in (self.group_list, self.user_list):
@@ -459,6 +468,9 @@ class ChatClient:
         if not text or not self.can_send(self.active):
             return
         kind, name = self.active
+        if kind == "pm" and name not in self.users:
+            self.flash(f"{name} is offline")
+            return
         if kind == "pm":
             sent = self.core.pm(name, text)
         else:
@@ -471,11 +483,14 @@ class ChatClient:
     def poll(self):
         if self.closed:
             return
-        while not self.inbox.empty():
-            self.handle(self.inbox.get())
-            if self.closed:
-                return
-        self.poll_job = self.root.after(100, self.poll)
+        try:
+            while not self.inbox.empty():
+                self.handle(self.inbox.get())
+                if self.closed:
+                    return
+        finally:
+            if not self.closed:  # an error still reaches Tk's report; later messages keep arriving
+                self.poll_job = self.root.after(100, self.poll)
 
     def handle(self, msg):
         try:
@@ -488,6 +503,7 @@ class ChatClient:
             self.users = msg["users"]
             self.render_sidebar()
         elif kind == "groups":  # R9
+            could_send = self.can_send(self.active)
             self.groups = msg["groups"]
             for g, members in self.groups.items():
                 if self.name in members:
@@ -500,7 +516,7 @@ class ChatClient:
                     if self.want == self.active:
                         self.want = None
                     self.select(None)
-                elif self.active and self.active[0] == "group":
+                elif self.active and self.active[0] == "group" and could_send != self.can_send(self.active):
                     self.select(self.active)
                 else:
                     self.render_sidebar()

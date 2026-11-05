@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-from protocol import FrameReader, encode_frame, validate_client_message, validate_server_event
+from protocol import FrameReader, enable_keepalive, encode_frame, validate_client_message, validate_server_event
 
 
 class ChatCore:
@@ -109,6 +109,7 @@ class ChatCore:
             if self.reader is None:
                 sock.settimeout(self.connect_timeout)
                 sock.connect((self.host, self.port))
+                enable_keepalive(sock)
                 with self._state_lock:
                     if self._closed or self.sock is not sock:
                         return False, "Login cancelled."
@@ -121,17 +122,16 @@ class ChatCore:
             if not line:
                 raise ConnectionError("The server closed the connection.")
             reply = validate_server_event(json.loads(line))
-            if reply["type"] != "login_ok":  # R3: name taken; same connection can retry.
+            if reply["type"] != "login_ok":  # R3: name taken. The next try reconnects, so the 10 s deadline cannot hit it.
+                self._drop_transport(sock)
                 return False, reply["text"]
-            if not isinstance(reply["name"], str) or not reply["name"]:
-                raise ValueError("Invalid login response")
             with self._state_lock:
                 if self._closed or self.sock is not sock:
                     return False, "Login cancelled."
                 self.name = reply["name"]
             sock.settimeout(None)  # Healthy logged-in clients may remain idle.
             return True, self.name
-        except (OSError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as exc:
+        except (OSError, OverflowError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as exc:
             if sock is not None:
                 self._drop_transport(sock)
             if self._closed:

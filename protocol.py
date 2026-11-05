@@ -4,6 +4,7 @@ Validators reject malformed fields without coercion. Extra fields are tolerated
 for compatibility; authority always comes from the server's connection state.
 """
 import json
+import socket
 import time
 
 # Project policy, not assignment requirements or measured performance limits.
@@ -12,8 +13,16 @@ MAX_TEXT_CHARS = 4_096
 MAX_NAME_CHARS = 64
 MAX_SESSIONS = 32  # active plus pending logins
 MAX_GROUPS = 64
-OUTBOUND_QUEUE_FRAMES = 64
+OUTBOUND_QUEUE_FRAMES = 1024  # shortcut: about 1000 unpaced messages at once still drop a client, pace bigger bursts
 LOGIN_TIMEOUT = 10.0  # absolute server deadline from accept
+
+
+def enable_keepalive(sock):
+    """Notice a dead link (Wi-Fi drop, laptop sleep) in about 20 s instead of never."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for option, value in (('TCP_KEEPIDLE', 10), ('TCP_KEEPINTVL', 3), ('TCP_KEEPCNT', 3)):
+        if hasattr(socket, option):  # macOS names these differently
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, option), value)
 
 
 def encode_frame(message, *, max_bytes=None):
@@ -86,7 +95,7 @@ SERVER_FIELDS = {
 
 
 def _name(value):
-    return isinstance(value, str) and bool(value.strip()) and len(value) <= MAX_NAME_CHARS
+    return isinstance(value, str) and bool(value.strip()) and len(value) <= MAX_NAME_CHARS and value.isprintable()
 
 
 def _validate_fields(msg, schemas):
@@ -100,7 +109,7 @@ def _validate_fields(msg, schemas):
         if isinstance(value, str) and field != 'text' and len(value) > MAX_NAME_CHARS:
             raise ValueError(f"Field '{field}' exceeds the {MAX_NAME_CHARS}-character name limit")
         if not isinstance(value, str) or (field != 'text' and not _name(value)):
-            raise ValueError(f"Field '{field}' must be " + ('a string' if field == 'text' else 'a nonempty string'))
+            raise ValueError(f"Field '{field}' must be " + ('a string' if field == 'text' else 'a nonempty string without invisible characters'))
         if field == 'text' and len(value) > MAX_TEXT_CHARS:
             raise ValueError('Text character limit exceeded')
     return msg

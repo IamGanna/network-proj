@@ -4,7 +4,7 @@ A small chat app in Python. One person runs the server and everyone else connect
 
 ## Features
 
-- Log in with a unique name
+- Log in with a unique name (upper and lower case count as the same name)
 - See who is online
 - Private messages between two people
 - Create groups, join groups, and chat with the group's members
@@ -20,8 +20,10 @@ A small chat app in Python. One person runs the server and everyone else connect
 On the computer that hosts the chat:
 
 ```
-python server.py
+python server.py [port]
 ```
+
+The server window shows each client's name and IP when it joins or leaves.
 
 On each computer that wants to chat, including the host:
 
@@ -29,7 +31,7 @@ On each computer that wants to chat, including the host:
 python client.py <server-ip> [port]
 ```
 
-For example, `python client.py 127.0.0.1` on the host itself, or `python client.py 192.168.1.20` from another computer on the same Wi-Fi. The port defaults to `5000`.
+For example, `python client.py 127.0.0.1` on the host itself, or `python client.py 192.168.1.20` from another computer on the same Wi-Fi. The port defaults to `5000`; use the same port on both sides.
 
 The login form opens even when the server is unavailable. Joining runs in a worker
 so the window stays responsive. Connection and login-response waits default to
@@ -37,7 +39,8 @@ five seconds each. Errors leave the form open for retry; a rejected name can be
 changed and submitted again. Closing the window cancels login and closes the
 connection. A lost logged-in connection is reported once and closes the client;
 start a new client to connect again. Healthy logged-in connections have no idle
-timeout. There is no automatic reconnection or offline delivery.
+timeout; TCP keepalive notices a dead link, such as a Wi-Fi drop, in about 20 seconds.
+There is no automatic reconnection or offline delivery.
 
 For other front ends, `ChatCore` connects on `login()`, which returns
 `(success, name_or_error)`. `start(callback)` starts one reader and invokes the
@@ -93,7 +96,7 @@ The constants are centralized in `protocol.py`.
 | User or group name | 64 Unicode characters |
 | Accepted server connections | 32 total, including pending logins |
 | Existing groups | 64 |
-| Outbound queue | 64 frames per server session |
+| Outbound queue | 1,024 frames per server session |
 | Server login deadline | 10 seconds from accept, including partial frames and rejected-name retries |
 
 Both endpoints bound byte input before JSON parsing. Split UTF-8 characters and
