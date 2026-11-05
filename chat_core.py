@@ -187,3 +187,6 @@ class ChatCore:
 
     def join_group(self, group):
         return self.send({"type": "join_group", "group": group})
+
+    def timeout_member(self, group, target, duration):
+        return self.send({"type": "timeout_member", "group": group, "target": target, "duration": str(duration)})
