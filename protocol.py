@@ -73,6 +73,8 @@ CLIENT_FIELDS = {
     'create_group': ('group',),
     'join_group': ('group',),
     'group_msg': ('group', 'text'),
+    'file_start': ('file_id', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
+    'file_chunk': ('file_id', 'chunk', 'data'),
 }
 SERVER_FIELDS = {
     'login_ok': ('name',),
@@ -82,6 +84,8 @@ SERVER_FIELDS = {
     'group_msg': ('group', 'from', 'text'),
     'error': ('text',),
     'disconnected': (),
+    'file_start': ('file_id', 'from', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
+    'file_chunk': ('file_id', 'chunk', 'data'),
 }
 
 
@@ -97,6 +101,16 @@ def _validate_fields(msg, schemas):
         raise ValueError('Unknown or missing message type')
     for field in schemas[kind]:
         value = msg.get(field)
+        if field == 'data':
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("Field 'data' must be a nonempty string")
+            continue
+        if field in ('filesize', 'chunks', 'chunk'):
+            if isinstance(value, int) and value >= 0:
+                continue
+            if isinstance(value, str) and value.isdigit():
+                continue
+            raise ValueError(f"Field '{field}' must be a non-negative integer or digit string")
         if isinstance(value, str) and field != 'text' and len(value) > MAX_NAME_CHARS:
             raise ValueError(f"Field '{field}' exceeds the {MAX_NAME_CHARS}-character name limit")
         if not isinstance(value, str) or (field != 'text' and not _name(value)):
