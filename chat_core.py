@@ -188,7 +188,7 @@ class ChatCore:
     def join_group(self, group):
         return self.send({"type": "join_group", "group": group})
 
-    def send_file(self, target_type, target, filepath, progress_callback=None):
+    def send_file(self, target_type, target, filepath, file_id=None, progress_callback=None):
         """Send a file in chunks over socket. Runs synchronously in caller thread."""
         import base64
         import os
@@ -202,7 +202,8 @@ class ChatCore:
             raise ValueError("File size exceeds 10MB limit")
 
         filename = os.path.basename(filepath)[:64]
-        file_id = uuid.uuid4().hex[:16]
+        if file_id is None:
+            file_id = uuid.uuid4().hex[:16]
 
         chunk_size = 32766  # Multiple of 3 (3 * 10922) so base64 chunks contain no padding
         total_chunks = max(1, (filesize + chunk_size - 1) // chunk_size) if filesize > 0 else 1

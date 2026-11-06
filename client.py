@@ -10,8 +10,15 @@ import queue
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 from chat_core import ChatCore
 from protocol import validate_server_event
@@ -482,7 +489,7 @@ class ChatClient:
             title="Select file or picture to send",
             filetypes=[
                 ("All files", "*.*"),
-                ("Images", "*.png;*.gif;*.jpg;*.jpeg"),
+                ("Images", "*.png;*.gif;*.jpg;*.jpeg;*.webp;*.bmp"),
                 ("Documents", "*.pdf;*.txt;*.docx"),
             ]
         )
@@ -490,6 +497,8 @@ class ChatClient:
             return
         try:
             filesize = os.path.getsize(filepath)
+            with open(filepath, "rb") as f:
+                raw_bytes = f.read()
         except OSError as exc:
             self.flash(f"Could not open file: {exc}")
             return
@@ -502,11 +511,14 @@ class ChatClient:
 
         target_type, target = self.active
         filename = os.path.basename(filepath)
+        file_id = uuid.uuid4().hex[:16]
+        self.file_data_store[file_id] = raw_bytes
         self.flash(f"Sending {filename}...")
 
         def upload():
-            ok = self.core.send_file(target_type, target, filepath)
+            ok = self.core.send_file(target_type, target, filepath, file_id=file_id)
             if not ok:
+                self.file_data_store.pop(file_id, None)
                 self.inbox.put({"type": "error", "text": f"Failed to send '{filename}'"})
 
         threading.Thread(target=upload, daemon=True).start()
@@ -518,6 +530,28 @@ class ChatClient:
             return f"{n / 1024:.1f} KB"
         return f"{n} B"
 
+    def create_image_thumbnail(self, filename, raw_bytes):
+        if HAS_PIL:
+            try:
+                import io
+                pil_im = Image.open(io.BytesIO(raw_bytes))
+                pil_im.thumbnail((360, 260))
+                return ImageTk.PhotoImage(pil_im)
+            except Exception:
+                pass
+        if filename.lower().endswith((".png", ".gif")):
+            try:
+                b64_str = base64.b64encode(raw_bytes).decode("ascii")
+                img = tk.PhotoImage(data=b64_str)
+                w, h = img.width(), img.height()
+                if w > 360 or h > 260:
+                    factor = max(1, (w + 359) // 360, (h + 259) // 260)
+                    img = img.subsample(factor, factor)
+                return img
+            except Exception:
+                pass
+        return None
+
     def show_file(self, key, sender, filename, filesize, file_id, raw_bytes=None):
         box = self.open_room(key)
         tag = "name:" + sender
@@ -528,24 +562,18 @@ class ChatClient:
         card = tk.Frame(box, bg="#1B1F27", padx=px(14), pady=px(10),
                         highlightthickness=px(1), highlightbackground=LINE)
 
-        # Image preview for PNG / GIF
-        if filename.lower().endswith((".png", ".gif")) and raw_bytes:
-            try:
-                b64_str = base64.b64encode(raw_bytes).decode("ascii")
-                img = tk.PhotoImage(data=b64_str)
-                w, h = img.width(), img.height()
-                if w > 360 or h > 260:
-                    factor = max(1, (w + 359) // 360, (h + 259) // 260)
-                    img = img.subsample(factor, factor)
+        # Image preview for image files
+        is_image = filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp"))
+        if is_image and raw_bytes:
+            img = self.create_image_thumbnail(filename, raw_bytes)
+            if img:
                 self.file_photos.append(img)
                 img_lbl = tk.Label(card, image=img, bg="#1B1F27")
                 img_lbl.pack(anchor="w", pady=(0, px(8)))
-            except Exception:
-                pass
 
         info_row = tk.Frame(card, bg="#1B1F27")
         info_row.pack(fill="x")
-        icon = "🖼️ " if filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg", ".webp")) else "📄 "
+        icon = "🖼️ " if is_image else "📄 "
         label(info_row, icon + filename, 10, bold=True).pack(side="left")
         label(info_row, f" ({self.format_bytes(filesize)})", 9, MUTED).pack(side="left")
 
@@ -566,6 +594,11 @@ class ChatClient:
 
         box.window_create("end", window=card)
         box.insert("end", "\n\n")
+        box.configure(state="disabled")
+        box.see("end")
+        if key != self.active:
+            self.unread[key] = self.unread.get(key, 0) + 1
+            self.render_sidebar()
         box.configure(state="disabled")
         box.see("end")
         if key != self.active:
@@ -625,7 +658,8 @@ class ChatClient:
             filename = msg["filename"]
             if sender == self.name:
                 room_key = ("pm", target) if target_type == "pm" else ("group", target)
-                self.show_file(room_key, sender, filename, filesize, file_id)
+                raw_bytes = self.file_data_store.get(file_id)
+                self.show_file(room_key, sender, filename, filesize, file_id, raw_bytes=raw_bytes)
             else:
                 self.incoming_files[file_id] = {"meta": msg, "chunks": {}}
         elif kind == "file_chunk":

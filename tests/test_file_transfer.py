@@ -126,5 +126,41 @@ class FileTransferTests(unittest.TestCase):
         self.assertIn("not a member", err["text"])
 
 
+    def test_client_ui_preview_for_sender_and_recipient_with_jpg_and_png(self):
+        import tkinter as tk
+        import client
+        from PIL import Image
+        import io
+
+        root = tk.Tk()
+        root.withdraw()
+        app = client.ChatClient(root)
+        app.name = "Alice"
+        app.login_frame.destroy()
+        app.build_ui()
+        self.addCleanup(app.close)
+
+        # 1. Create dummy JPG bytes
+        im = Image.new("RGB", (200, 150), color="red")
+        buf = io.BytesIO()
+        im.save(buf, format="JPEG")
+        jpg_bytes = buf.getvalue()
+
+        # Sender view: show_file with raw_bytes
+        app.show_file(("pm", "Bob"), "Alice", "photo.jpg", len(jpg_bytes), "fid1", raw_bytes=jpg_bytes)
+        self.assertGreater(len(app.file_photos), 0)
+
+        # Recipient view: show_file with raw_bytes
+        app.show_file(("pm", "Bob"), "Bob", "received.jpg", len(jpg_bytes), "fid2", raw_bytes=jpg_bytes)
+        self.assertGreater(len(app.file_photos), 1)
+
+        # 2. Test PNG file preview
+        buf_png = io.BytesIO()
+        im.save(buf_png, format="PNG")
+        png_bytes = buf_png.getvalue()
+        app.show_file(("pm", "Bob"), "Bob", "diagram.png", len(png_bytes), "fid3", raw_bytes=png_bytes)
+        self.assertGreater(len(app.file_photos), 2)
+
+
 if __name__ == "__main__":
     unittest.main()
