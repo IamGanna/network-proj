@@ -4,6 +4,7 @@ Validators reject malformed fields without coercion. Extra fields are tolerated
 for compatibility; authority always comes from the server's connection state.
 """
 import json
+import re
 import socket
 import time
 
@@ -15,6 +16,13 @@ MAX_SESSIONS = 32  # active plus pending logins
 MAX_GROUPS = 64
 OUTBOUND_QUEUE_FRAMES = 1024  # shortcut: about 1000 unpaced messages at once still drop a client, pace bigger bursts
 LOGIN_TIMEOUT = 10.0  # absolute server deadline from accept
+AI_MAX_MESSAGES = 512
+AI_MAX_HISTORY_BYTES = 262_144
+AI_MAX_INSTRUCTION = 500
+AI_TEXT_LIMITS = {'summary': 3000, 'draft': 600}
+AI_ERROR_CODES = frozenset(('unavailable', 'no_history', 'not_allowed', 'history_limit',
+                            'busy', 'cooldown', 'timeout', 'budget', 'rate_limit',
+                            'provider', 'invalid_response'))
 
 
 def enable_keepalive(sock):
@@ -117,11 +125,15 @@ def _validate_fields(msg, schemas):
 
 def validate_client_message(msg: object) -> dict:
     """Validate a command before routing; raise ValueError for bad schemas."""
+    if isinstance(msg, dict) and msg.get('type') == 'ai_request':
+        return _validate_ai(msg)
     return _validate_fields(msg, CLIENT_FIELDS)
 
 
 def validate_server_event(msg: object) -> dict:
     """Validate an event, including nested public membership metadata."""
+    if isinstance(msg, dict) and msg.get('type') in ('ai_result', 'ai_error'):
+        return _validate_ai(msg)
     msg = _validate_fields(msg, SERVER_FIELDS)
     if msg['type'] == 'users':
         users = msg.get('users')
@@ -134,4 +146,36 @@ def validate_server_event(msg: object) -> dict:
             for group, members in groups.items()
         ):
             raise ValueError("Field 'groups' must map group names to lists of member names")
+    return msg
+
+
+def _validate_ai(msg):
+    common = {'type', 'request_id', 'action', 'room_type', 'room'}
+    kind = msg['type']
+    extra = {'ai_request': {'instruction'}, 'ai_result': {'text', 'message_count', 'cutoff'},
+             'ai_error': {'code', 'text'}}[kind]
+    if set(msg) != common | extra:
+        raise ValueError('Unexpected or missing AI fields')
+    if not isinstance(msg['request_id'], str) or not re.fullmatch('[0-9a-f]{32}', msg['request_id']):
+        raise ValueError('Invalid AI request ID')
+    if msg['action'] not in ('summary', 'draft') or msg['room_type'] not in ('pm', 'group') or not _name(msg['room']):
+        raise ValueError('Invalid AI action or room')
+    if kind == 'ai_request':
+        instruction = msg['instruction']
+        if not isinstance(instruction, str) or len(instruction) > AI_MAX_INSTRUCTION or (msg['action'] == 'summary' and instruction):
+            raise ValueError('Invalid AI instruction')
+    else:
+        limit = 256 if kind == 'ai_error' else AI_TEXT_LIMITS[msg['action']]
+        value = msg['text']
+        if not isinstance(value, str) or not value.strip() or len(value) > limit:
+            raise ValueError('Invalid AI output text')
+        try:
+            value.encode('utf-8')
+        except UnicodeError:
+            raise ValueError('Invalid AI output encoding') from None
+        if kind == 'ai_error':
+            if not isinstance(msg['code'], str) or msg['code'] not in AI_ERROR_CODES:
+                raise ValueError('Invalid AI error code')
+        elif any(type(msg[k]) is not int or msg[k] < 0 for k in ('message_count', 'cutoff')) or msg['message_count'] > AI_MAX_MESSAGES:
+            raise ValueError('Invalid AI history metadata')
     return msg

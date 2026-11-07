@@ -9,6 +9,7 @@ A small chat app in Python. One person runs the server and everyone else connect
 - Private messages between two people
 - Create groups, join groups, and chat with the group's members
 - Dark desktop UI that stays sharp on high-DPI (scaled) Windows displays
+- Private AI summaries and concise reply drafts for private chats and joined groups
 
 ## Requirements
 
@@ -53,6 +54,86 @@ Run the local regression suite with `python -B -m unittest discover -v`.
 Tests require Tk and localhost socket access. Handler tests verify local routing;
 they do not establish operation on different physical computers.
 
+## AI setup (server computer)
+
+Copy `.env.example` to `.env` beside `server.py`, then edit locally:
+
+```dotenv
+OPENROUTER_API_KEY=your-key-here
+```
+
+Restart the server after changing it. The loader uses this exact file even when
+the server starts from a different directory. It accepts plain or quoted values,
+optional `export`, and comments; it does not expand variables or execute shell
+commands. A process `OPENROUTER_API_KEY` overrides `.env` (an empty override disables
+AI). Missing/empty configuration leaves normal chat available. No extra packages
+are needed. `.env` and `.env.*` are ignored by Git; `.env.example` contains no key.
+Keep the real file on the server computer. GitHub Secrets are only useful for an
+explicit deployment workflow; clients do not fetch a secret from GitHub.
+
+OpenRouter charges the one shared key for all users. The operator's configured
+$1/week cap is shared across the demo, rather than per person. The app reports
+budget exhaustion and does not retry or switch models automatically.
+
+Open a private chat or joined group, then:
+
+- **Summarize** opens a private, read-only summary: topic, who said what, and the
+  current discussion state. It understands Thai/English and follows the main
+  conversation language, aiming for 200–300 output tokens (shorter for short chats).
+- **Draft reply** accepts an optional instruction. Generate replaces that room's
+  existing draft with a concise response in the conversation's language. It never
+  sends automatically. Only that room's composer is frozen while drafting; other
+  rooms remain usable. Errors/timeouts retain the exact original draft.
+
+The server supplies only messages routed to your current login session. Group
+context starts when you joined. Nothing is loaded from past app sessions, and
+generated results are not added to chat history unless you explicitly send a
+draft. Switching rooms during generation preserves the original target room.
+Results are sent only to the requester, never broadcast to the chat.
+
+Clicking either feature sends the selected room's session messages to OpenRouter
+and its model provider over HTTPS. The key stays in the server's Authorization
+header. Client/server chat remains on the existing TCP connection. The provider
+request uses `data_collection: deny`, `zdr: true`, and `require_parameters: true`;
+availability and retention exceptions depend on provider/account policy, as
+described in [OpenRouter's ZDR documentation](https://openrouter.ai/docs/guides/features/zdr).
+These controls do not encrypt the application's existing plaintext chat TCP link.
+
+The pinned model is `deepseek/deepseek-v4.1-flash-20261017`, exactly as requested.
+Its exact date-long API identifier and configured routing succeeded in a
+synthetic summary/draft smoke on 2026-11-07. The app does not substitute another
+identifier silently. Settings in `ai_service.py`:
+
+| Setting | Summary | Reply draft |
+|---|---:|---:|
+| Temperature | 0.2 | 0.4 |
+| Maximum output tokens | 384 | 120 |
+| Maximum output characters | 3,000 | 600 |
+
+Both use `top_p=1`, non-streaming responses and disabled reasoning. Empty,
+truncated, tool-call, invalid or overlong answers are rejected. Sampling and
+prompting do not guarantee factuality; review generated text before sending.
+
+AI has one pending request per user, a five-second accepted-request cooldown,
+and two total jobs across the server. Complete histories are bounded to 512
+messages and 256 KiB of canonical escaped JSON per session across rooms. If either
+limit is exceeded, AI is disabled for that session instead of silently omitting
+older context; normal chat continues. Reopening the app starts a new session.
+Each request has a 30-second response acceptance budget and a 35-second UI timeout.
+Socket operations have bounded waits, but DNS/header trickling may delay a worker
+beyond the budget; late results are rejected, and no extra workers are spawned.
+
+For an opt-in live check with synthetic Thai/English messages only:
+
+```powershell
+python -X utf8 tools/ai_smoke.py --live
+```
+
+This makes at most one summary and one draft request, stops on the first error,
+and may spend from the shared key. Without `--live`, it reads no key and makes no
+API call. The automated suite uses fake model/HTTP responses; it cannot establish
+live model quality or privacy-route eligibility.
+
 
 ## Project layout
 
@@ -62,6 +143,10 @@ they do not establish operation on different physical computers.
 | `chat_core.py` | Client networking with no UI: login, sending, and a background reader. Any front end can reuse it. |
 | `client.py` | Tkinter desktop UI built on `chat_core.py`. |
 | `protocol.py` | Shared schemas, limits, serialized frames and bounded byte reader. |
+| `ai_history.py` | Complete, bounded histories per session and room. |
+| `ai_service.py` | Server-only .env loading, prompts and bounded OpenRouter HTTPS. |
+| `ai_runtime.py` | Two workers with nonblocking, bounded job admission. |
+| `tools/ai_smoke.py` | Explicit opt-in live check using synthetic conversations. |
 
 ## Protocol
 
@@ -74,6 +159,7 @@ Clients and the server exchange newline-delimited JSON over a single TCP connect
 | `create_group` | `group` |
 | `join_group` | `group` |
 | `group_msg` | `group`, `text` |
+| `ai_request` | `request_id` (32 lowercase hex), `action` (`summary`/`draft`), `room_type`, `room`, `instruction` (0–500 characters; empty for summary) |
 
 | Server → client | Fields |
 |---|---|
@@ -83,6 +169,8 @@ Clients and the server exchange newline-delimited JSON over a single TCP connect
 | `pm` | `from`, `to`, `text` |
 | `group_msg` | `group`, `from`, `text` |
 | `error` | `text` |
+| `ai_result` | `request_id`, `action`, `room_type`, `room`, `text`, `message_count`, `cutoff` (session message sequence) |
+| `ai_error` | `request_id`, `action`, `room_type`, `room`, `code`, `text` |
 
 ## Resource policy
 
@@ -121,6 +209,6 @@ machine-independent throughput claim is implied by these limits.
 
 ## todo 
     - deploy on cloud 
-    - implement feature
+    - physical-computer demonstration
 
 

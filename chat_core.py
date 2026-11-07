@@ -62,14 +62,17 @@ class ChatCore:
     def send(self, msg):
         """True means local transport acceptance, not recipient display."""
         try:
-            if any(not isinstance(value, str) or not value.strip() for value in msg.values()):
-                raise ValueError("Names and message text must be nonempty strings.")
             validate_client_message(msg)
+            if msg['type'] in ('pm', 'group_msg') and not msg['text'].strip():
+                raise ValueError('Message text must be nonempty.')
             data = encode_frame(msg)
         except (ValueError, TypeError) as exc:
             self._emit({"type": "error", "text": str(exc)})
             return False
-        with self._send_lock:
+        if not self._send_lock.acquire(blocking=False):
+            self._emit({'type':'error', 'text':'Another message is being sent. Try again.'})
+            return False
+        try:
             with self._state_lock:
                 sock = self.sock if self.name and not self._closed else None
             if sock is None:
@@ -83,6 +86,8 @@ class ChatCore:
                 self._notify_disconnected()
                 self._drop_transport(sock)
                 return False
+        finally:
+            self._send_lock.release()
 
     def login(self, name):
         """Blocking. Returns (True, name) or (False, error text). Call before start()."""
@@ -187,3 +192,7 @@ class ChatCore:
 
     def join_group(self, group):
         return self.send({"type": "join_group", "group": group})
+
+    def request_ai(self, request_id, action, room_type, room, instruction=''):
+        return self.send(dict(type='ai_request', request_id=request_id, action=action,
+                              room_type=room_type, room=room, instruction=instruction))
