@@ -308,7 +308,7 @@ class ChatClient:
             box = tk.Text(self.stage, bg=PANEL, fg=TEXT, relief="flat", wrap="word", padx=px(24), pady=px(16),
                           font=(FONT, 11), state="disabled", cursor="arrow", highlightthickness=0)
             box.tag_config("time", foreground=DIM, font=(FONT, 9))
-            box.tag_config("body", foreground="#DCDAD5", spacing3=px(12))
+            box.tag_config("body", foreground="#DCDAD5")
             box.place(relwidth=1, relheight=1)
             self.rooms[key] = box
             visible = (self.preview if self.active and self.active[0] == "group"
@@ -325,7 +325,7 @@ class ChatClient:
             fg = ACCENT
         else:
             fg = color_for(sender)
-        box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"))
+        box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(12))  # gap above each message, not below every line
         box.configure(state="normal")
         box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
         box.configure(state="disabled")
@@ -671,7 +671,7 @@ class ChatClient:
     def show_file(self, key, sender, filename, filesize, file_id, raw_bytes=None):
         box = self.open_room(key)
         tag = "name:" + sender
-        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
+        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"), spacing1=px(12))
         box.configure(state="normal")
         box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time")
 
