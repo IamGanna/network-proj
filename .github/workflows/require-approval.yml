@@ -1,0 +1,52 @@
+name: Require PR Approval
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions:
+  pull-requests: read
+  contents: read
+
+jobs:
+  check-approval:
+    name: Verify PR Approval
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check Review Status
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=================================================="
+          echo "Checking reviews for PR #$PR_NUMBER in $REPO..."
+          echo "=================================================="
+
+          PR_DATA=$(gh pr view "$PR_NUMBER" -R "$REPO" --json author,latestReviews)
+          AUTHOR=$(echo "$PR_DATA" | jq -r '.author.login')
+
+          CHANGES=$(echo "$PR_DATA" | jq '[.latestReviews[] | select(.state == "CHANGES_REQUESTED")] | length')
+          APPROVALS=$(echo "$PR_DATA" | jq --arg author "$AUTHOR" '[.latestReviews[] | select(.state == "APPROVED" and .author.login != $author)] | length')
+
+          echo "PR Author: $AUTHOR"
+          echo "Approved reviews (excluding author): $APPROVALS"
+          echo "Changes requested: $CHANGES"
+          echo "=================================================="
+
+          if [ "$CHANGES" -gt 0 ]; then
+            echo "❌ FAILED: There are outstanding 'Changes requested' reviews."
+            echo "All change requests must be resolved before this PR can be merged."
+            exit 1
+          fi
+
+          if [ "$APPROVALS" -ge 1 ]; then
+            echo "✅ PASSED: This PR has received at least 1 approved review from a peer."
+            exit 0
+          else
+            echo "❌ FAILED: This PR requires at least 1 approval before merging."
+            echo "Please request a review from a teammate and wait for approval."
+            exit 1
+          fi
