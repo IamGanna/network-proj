@@ -150,6 +150,8 @@ class ChatClient:
         self.incoming_files = {}  # file_id -> {"meta": msg, "chunks": {}}
         self.file_data_store = {}  # file_id -> raw_bytes
         self.file_photos = []  # retain PhotoImage references
+        self.group_timeouts = {}  # group -> {member: expiry_timestamp}
+        self.my_timeouts = {}     # group -> expiry_timestamp
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
@@ -317,7 +319,13 @@ class ChatClient:
     def show(self, key, sender, text):
         box = self.open_room(key)
         tag = "name:" + sender
-        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
+        if sender == "[System]":
+            fg = "#FF9B8A"
+        elif sender == self.name:
+            fg = ACCENT
+        else:
+            fg = color_for(sender)
+        box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"))
         box.configure(state="normal")
         box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
         box.configure(state="disabled")
@@ -326,11 +334,37 @@ class ChatClient:
             self.unread[key] = self.unread.get(key, 0) + 1
             self.render_sidebar()
 
+    def is_my_timeout_active(self, group):
+        exp = self.my_timeouts.get(group)
+        if exp is None:
+            return False
+        if time.time() >= exp:
+            self.my_timeouts.pop(group, None)
+            return False
+        return True
+
+    def format_remaining(self, seconds):
+        if seconds >= 86400:
+            return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+        if seconds >= 3600:
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+        if seconds >= 60:
+            return f"{seconds // 60}m {seconds % 60}s"
+        return f"{seconds}s"
+
     def can_send(self, key):
         if not key:
             return False
         kind, name = key
-        return kind == "pm" or (kind == "group" and self.name in self.groups.get(name, []))
+        if kind == "pm":
+            return True
+        if kind == "group":
+            if self.name not in self.groups.get(name, []):
+                return False
+            if self.is_my_timeout_active(name):
+                return False
+            return True
+        return False
 
     def select(self, key):
         if key and key[0] == "group" and key[1] not in self.groups:
@@ -355,9 +389,15 @@ class ChatClient:
             kind, name = key
             self.title.config(text=("#  " if kind == "group" else "@  ") + name)
             if kind == "group" and not allowed:
-                self.subtitle.config(text="Public membership preview · You have not joined")
-                self.preview.tkraise()
-                self.join_button.pack(anchor="w", pady=(px(6), 0))
+                if self.name not in self.groups.get(name, []):
+                    self.subtitle.config(text="Public membership preview · You have not joined")
+                    self.preview.tkraise()
+                    self.join_button.pack(anchor="w", pady=(px(6), 0))
+                else:
+                    self.unread.pop(key, None)
+                    self.open_room(key).tkraise()
+                    rem = max(1, int(self.my_timeouts.get(name, time.time()) - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
             else:
                 self.unread.pop(key, None)
                 self.open_room(key).tkraise()
@@ -415,17 +455,93 @@ class ChatClient:
         if not self.active or self.active[0] != "group" or self.active[1] not in self.groups:
             self.members_panel.pack_forget()
             return
-        members = self.groups[self.active[1]]
+        g = self.active[1]
+        members = self.groups[g]
+        owner = members[0] if members else None
+        is_owner = (self.name == owner)
+        timeouts = self.group_timeouts.get(g, {})
+        now = time.time()
+
         label(self.members_panel, f"MEMBERS · {len(members)}", 9, MUTED, bold=True).pack(anchor="w", pady=(0, px(8)))
         self.member_list = ScrollList(self.members_panel)
         self.member_list.pack(fill="both", expand=True)
         for m in members:
             r = tk.Frame(self.member_list.content, bg=PANEL, pady=px(5))
             r.pack(fill="x")
-            avatar(r, m).pack(side="left", padx=(0, px(10)))
+            avatar(r, m).pack(side="left", padx=(0, px(8)))
             label(r, m + (" (you)" if m == self.name else ""), 10).pack(side="left")
+            if m == owner:
+                tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
+                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+            is_timed_out = (m in timeouts and now < timeouts[m])
+            if is_timed_out:
+                tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
+                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+            if is_owner and m != self.name:
+                btn_txt = "Manage" if is_timed_out else "Timeout"
+                btn = tk.Button(r, text=btn_txt, command=lambda target=m: self.open_timeout_dialog(target),
+                                relief="flat", bd=0, cursor="hand2", bg=RAISED, fg=TEXT,
+                                activebackground=LINE, activeforeground=TEXT,
+                                font=(FONT, 8, "bold"), padx=px(6), pady=px(2))
+                btn.pack(side="right")
             self.member_list.bind_controls(r)
         self.members_panel.pack(side="right", fill="y", padx=(px(8), 0), before=self.center)
+
+    def open_timeout_dialog(self, target):
+        if not self.active or self.active[0] != "group":
+            return
+        g = self.active[1]
+        dlg = tk.Toplevel(self.root, bg=PANEL, padx=px(24), pady=px(20))
+        dlg.title(f"Timeout {target}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        label(dlg, f"Timeout {target}", 14, bold=True).pack(anchor="w")
+        label(dlg, f"Select how long {target} will be unable to send messages in #{g}.",
+              10, MUTED, wraplength=px(320), justify="left").pack(anchor="w", pady=(px(4), px(12)))
+
+        timeouts = self.group_timeouts.get(g, {})
+        now = time.time()
+        is_currently_timed_out = target in timeouts and now < timeouts[target]
+        if is_currently_timed_out:
+            rem = max(1, int(timeouts[target] - now))
+            status_box = tk.Frame(dlg, bg="#2A1E1E", padx=px(10), pady=px(8))
+            status_box.pack(fill="x", pady=(0, px(12)))
+            label(status_box, f"Currently timed out ({self.format_remaining(rem)} remaining)",
+                  9, ERROR, bold=True).pack(anchor="w")
+
+        dur_var = tk.StringVar(value="60")
+        options = [
+            ("60 seconds (1 minute)", "60"),
+            ("5 minutes", "300"),
+            ("10 minutes", "600"),
+            ("1 hour", "3600"),
+            ("1 day", "86400"),
+            ("1 week", "604800"),
+        ]
+
+        opts_frame = tk.Frame(dlg, bg=PANEL)
+        opts_frame.pack(fill="x", pady=(0, px(16)))
+
+        for text, val in options:
+            rb = tk.Radiobutton(opts_frame, text=text, value=val, variable=dur_var,
+                                bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL,
+                                activeforeground=TEXT, font=(FONT, 10), cursor="hand2")
+            rb.pack(anchor="w", pady=px(2))
+
+        btns = tk.Frame(dlg, bg=PANEL)
+        btns.pack(fill="x", pady=(px(8), 0))
+
+        def apply_timeout(duration):
+            self.core.timeout_member(g, target, duration)
+            dlg.destroy()
+
+        button(btns, "Apply Timeout", lambda: apply_timeout(dur_var.get()), primary=True).pack(side="right")
+        if is_currently_timed_out:
+            button(btns, "Remove Timeout", lambda: apply_timeout("0"), bg="#3A2320").pack(side="right", padx=(0, px(8)))
+        button(btns, "Cancel", dlg.destroy).pack(side="right", padx=(0, px(8)))
+
+        dlg.grab_set()
 
     def flash(self, text):
         self.error_bar.config(text=text)
@@ -613,7 +729,24 @@ class ChatClient:
             self.handle(self.inbox.get())
             if self.closed:
                 return
+        self.check_timeout_countdown()
         self.poll_job = self.root.after(100, self.poll)
+
+    def check_timeout_countdown(self):
+        if self.active and self.active[0] == "group":
+            g = self.active[1]
+            if self.is_my_timeout_active(g):
+                rem = int(self.my_timeouts[g] - time.time())
+                if rem > 0:
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+                    self.entry.config(state="disabled")
+                    self.send_button.config(state="disabled")
+                else:
+                    self.my_timeouts.pop(g, None)
+                    self.entry.config(state="normal")
+                    self.send_button.config(state="normal")
+                    self.subtitle.config(text="Only members see these messages")
+                    self.render_members()
 
     def handle(self, msg):
         try:
@@ -647,7 +780,7 @@ class ChatClient:
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
         elif kind == "group_msg":
-            if self.can_send(("group", msg["group"])):
+            if self.name in self.groups.get(msg["group"], []):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
         elif kind == "file_start":
             file_id = msg["file_id"]
@@ -683,6 +816,33 @@ class ChatClient:
                     target = meta["target"]
                     room_key = ("pm", sender) if target_type == "pm" else ("group", target)
                     self.show_file(room_key, sender, meta["filename"], len(raw_bytes), file_id, raw_bytes=raw_bytes)
+        elif kind == "timeout_notice":
+            g = msg["group"]
+            target = msg["target"]
+            try:
+                secs = int(msg.get("seconds", 0))
+            except (ValueError, TypeError):
+                secs = 0
+            if secs <= 0:
+                if g in self.group_timeouts:
+                    self.group_timeouts[g].pop(target, None)
+                if target == self.name:
+                    self.my_timeouts.pop(g, None)
+            else:
+                exp = time.time() + secs
+                self.group_timeouts.setdefault(g, {})[target] = exp
+                if target == self.name:
+                    self.my_timeouts[g] = exp
+            if self.active and self.active == ("group", g):
+                allowed = self.can_send(self.active)
+                self.entry.config(state="normal" if allowed else "disabled")
+                self.send_button.config(state="normal" if allowed else "disabled")
+                if self.is_my_timeout_active(g):
+                    rem = max(1, int(self.my_timeouts[g] - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+                elif self.name in self.groups.get(g, []):
+                    self.subtitle.config(text="Only members see these messages")
+            self.render_members()
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])
