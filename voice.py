@@ -12,7 +12,8 @@ import pygame
 import requests
 import sounddevice as sd
 
-_VOICE = "th-TH-NiwatNeural"
+_VOICE_TH = "th-TH-NiwatNeural"
+_VOICE_EN = "en-US-AriaNeural"
 _SR = 16000
 _TYPHOON_URL = "https://api.opentyphoon.ai/v1/audio/transcriptions"
 
@@ -24,8 +25,10 @@ _frames_lock = threading.Lock()
 def speak(text):
     """Fire-and-forget TTS; returns immediately."""
     def _run():
+        voice = _VOICE_TH if any("฀" <= c <= "๿" for c in text) else _VOICE_EN
+
         async def _save(path):
-            await edge_tts.Communicate(text, voice=_VOICE).save(path)
+            await edge_tts.Communicate(text, voice=voice).save(path)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             path = f.name

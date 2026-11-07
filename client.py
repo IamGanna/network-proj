@@ -613,7 +613,7 @@ class ChatClient:
     def _on_transcribed(self, text):
         if text and not self.closed:
             self.root.after(0, lambda: (
-                self.entry.delete(0, "end") or self.entry.insert(0, text)
+                self.entry.insert("end", (" " + text) if self.entry.get() else text)
             ) if self.entry["state"] == "normal" else None)
 
     def _toggle_speak(self):
