@@ -188,5 +188,53 @@ class ChatCore:
     def join_group(self, group):
         return self.send({"type": "join_group", "group": group})
 
+    def send_file(self, target_type, target, filepath, file_id=None, progress_callback=None):
+        """Send a file in chunks over socket. Runs synchronously in caller thread."""
+        import base64
+        import os
+        import uuid
+
+        if not os.path.isfile(filepath):
+            raise FileNotFoundError(f"File not found: {filepath}")
+
+        filesize = os.path.getsize(filepath)
+        if filesize > 10 * 1024 * 1024:
+            raise ValueError("File size exceeds 10MB limit")
+
+        filename = os.path.basename(filepath)[:64]
+        if file_id is None:
+            file_id = uuid.uuid4().hex[:16]
+
+        chunk_size = 32766  # Multiple of 3 (3 * 10922) so base64 chunks contain no padding
+        total_chunks = max(1, (filesize + chunk_size - 1) // chunk_size) if filesize > 0 else 1
+
+        start_msg = {
+            "type": "file_start",
+            "file_id": file_id,
+            "target_type": target_type,
+            "target": target,
+            "filename": filename,
+            "filesize": str(filesize),
+            "chunks": str(total_chunks),
+        }
+        if not self.send(start_msg):
+            return False
+
+        with open(filepath, "rb") as f:
+            for index in range(total_chunks):
+                raw = f.read(chunk_size)
+                b64 = base64.b64encode(raw).decode("ascii")
+                chunk_msg = {
+                    "type": "file_chunk",
+                    "file_id": file_id,
+                    "chunk": str(index),
+                    "data": b64,
+                }
+                if not self.send(chunk_msg):
+                    return False
+                if progress_callback:
+                    progress_callback(index + 1, total_chunks)
+        return True
+
     def timeout_member(self, group, target, duration):
         return self.send({"type": "timeout_member", "group": group, "target": target, "duration": str(duration)})

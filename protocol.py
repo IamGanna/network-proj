@@ -73,6 +73,8 @@ CLIENT_FIELDS = {
     'create_group': ('group',),
     'join_group': ('group',),
     'group_msg': ('group', 'text'),
+    'file_start': ('file_id', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
+    'file_chunk': ('file_id', 'chunk', 'data'),
     'timeout_member': ('group', 'target', 'duration'),
 }
 SERVER_FIELDS = {
@@ -83,6 +85,8 @@ SERVER_FIELDS = {
     'group_msg': ('group', 'from', 'text'),
     'error': ('text',),
     'disconnected': (),
+    'file_start': ('file_id', 'from', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
+    'file_chunk': ('file_id', 'chunk', 'data'),
     'timeout_notice': ('group', 'target', 'seconds'),
 }
 
@@ -99,7 +103,11 @@ def _validate_fields(msg, schemas):
         raise ValueError('Unknown or missing message type')
     for field in schemas[kind]:
         value = msg.get(field)
-        if field in ('duration', 'seconds'):
+        if field == 'data':
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("Field 'data' must be a nonempty string")
+            continue
+        if field in ('filesize', 'chunks', 'chunk', 'duration', 'seconds'):
             if isinstance(value, int) and value >= 0:
                 continue
             if isinstance(value, str) and value.isdigit():

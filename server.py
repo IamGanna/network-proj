@@ -15,6 +15,7 @@ HOST, PORT = "0.0.0.0", 5000  # 0.0.0.0 = accept connections from other computer
 
 clients = {}  # name -> Session
 groups = {}   # group name -> list of member names
+active_transfers = {}  # file_id -> transfer metadata
 group_creators = {}  # group name -> creator name
 group_timeouts = {}  # group name -> {target_member_name: expiry_timestamp}
 lock = threading.Lock()  # guards state, recipient selection and outbound enqueue order
@@ -104,6 +105,9 @@ def disconnect_sessions(pending):
             name = session.name
             if name is not None and clients.get(name) is session:
                 del clients[name]
+                for fid in list(active_transfers):
+                    if active_transfers[fid]["from"] == name:
+                        del active_transfers[fid]
                 for group in list(groups):
                     if name in groups[group]:
                         groups[group].remove(name)
@@ -115,6 +119,8 @@ def disconnect_sessions(pending):
                             group_timeouts.pop(group, None)
                         elif group_creators.get(group) == name:
                             group_creators[group] = groups[group][0]
+                if not clients:
+                    active_transfers.clear()
                 if not groups:
                     group_creators.clear()
                     group_timeouts.clear()
@@ -242,6 +248,99 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                                 for member in groups[g]:
                                     if not clients[member].enqueue(output):
                                         failed.add(clients[member])
+
+                elif kind == "file_start":
+                    target_type = msg.get("target_type")
+                    target = msg.get("target")
+                    file_id = msg.get("file_id")
+                    filename = msg.get("filename")
+                    filesize_str = msg.get("filesize")
+                    chunks_str = msg.get("chunks")
+
+                    try:
+                        filesize = int(filesize_str)
+                        chunks = int(chunks_str)
+                        if filesize <= 0 or chunks <= 0 or filesize > 10 * 1024 * 1024:
+                            raise ValueError()
+                    except (ValueError, TypeError):
+                        send(session, {"type": "error", "text": "Invalid file size or chunk count (max 10MB)"}, failed)
+                    else:
+                        if target_type not in ("pm", "group"):
+                            send(session, {"type": "error", "text": "Invalid target type"}, failed)
+                        elif target_type == "pm" and target not in clients:
+                            send(session, {"type": "error", "text": f"{target} is offline"}, failed)
+                        elif target_type == "group" and (target not in groups or name not in groups[target]):
+                            send(session, {"type": "error", "text": f"You are not a member of '{target}'"}, failed)
+                        elif target_type == "group" and name in group_timeouts.get(target, {}) and time.time() < group_timeouts[target][name]:
+                            send(session, {"type": "error", "text": f"You are timed out in '{target}'"}, failed)
+                        else:
+                            out = {
+                                "type": "file_start",
+                                "file_id": file_id,
+                                "from": name,
+                                "target_type": target_type,
+                                "target": target,
+                                "filename": filename,
+                                "filesize": filesize_str,
+                                "chunks": chunks_str,
+                            }
+                            try:
+                                output = encode(out)
+                            except ValueError:
+                                send(session, {"type": "error", "text": "Frame limit reached"}, failed)
+                            else:
+                                active_transfers[file_id] = {
+                                    "from": name,
+                                    "target_type": target_type,
+                                    "target": target,
+                                    "total_chunks": chunks,
+                                    "received_chunks": 0,
+                                }
+                                if target_type == "pm":
+                                    for rec in {clients[target], session}:
+                                        if not rec.enqueue(output):
+                                            failed.add(rec)
+                                else:
+                                    for member in groups[target]:
+                                        if not clients[member].enqueue(output):
+                                            failed.add(clients[member])
+
+                elif kind == "file_chunk":
+                    file_id = msg.get("file_id")
+                    chunk = msg.get("chunk")
+                    data_chunk = msg.get("data")
+                    if file_id not in active_transfers:
+                        send(session, {"type": "error", "text": "Unknown or expired file transfer"}, failed)
+                    else:
+                        trans = active_transfers[file_id]
+                        if trans["from"] != name:
+                            send(session, {"type": "error", "text": "Unauthorized file chunk"}, failed)
+                        else:
+                            out = {
+                                "type": "file_chunk",
+                                "file_id": file_id,
+                                "chunk": chunk,
+                                "data": data_chunk,
+                            }
+                            try:
+                                output = encode(out)
+                            except ValueError:
+                                send(session, {"type": "error", "text": "Frame limit reached"}, failed)
+                            else:
+                                trans["received_chunks"] += 1
+                                if trans["target_type"] == "pm":
+                                    target = trans["target"]
+                                    if target in clients:
+                                        if not clients[target].enqueue(output):
+                                            failed.add(clients[target])
+                                else:
+                                    g = trans["target"]
+                                    for member in groups.get(g, []):
+                                        if member != name:
+                                            if not clients[member].enqueue(output):
+                                                failed.add(clients[member])
+                                if trans["received_chunks"] >= trans["total_chunks"]:
+                                    del active_transfers[file_id]
 
                 elif kind == "timeout_member":
                     g = msg.get("group")
