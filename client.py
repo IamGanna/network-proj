@@ -23,7 +23,10 @@ except ImportError:
 
 from chat_core import ChatCore
 from protocol import validate_server_event
-import voice
+try:
+    import voice
+except ImportError:
+    voice = None
 
 _env = Path(__file__).parent / ".env"
 if _env.exists():
