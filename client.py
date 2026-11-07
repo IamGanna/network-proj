@@ -2,6 +2,7 @@
 
 Run: python client.py <server-ip> [port]      e.g. python client.py 192.168.1.20
 """
+import base64
 import ctypes
 import argparse
 import os
@@ -9,9 +10,16 @@ import queue
 import sys
 import threading
 import time
+import uuid
 import tkinter as tk
 from pathlib import Path
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 from chat_core import ChatCore
 from protocol import validate_server_event
@@ -148,6 +156,9 @@ class ChatClient:
 
         self.users = []
         self.groups = {}
+        self.incoming_files = {}  # file_id -> {"meta": msg, "chunks": {}}
+        self.file_data_store = {}  # file_id -> raw_bytes
+        self.file_photos = []  # retain PhotoImage references
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
@@ -289,8 +300,10 @@ class ChatClient:
         self.entry = entry(composer)  # chat box (R6)
         self.entry.pack(side="left", fill="x", expand=True, ipady=px(10))
         self.entry.bind("<Return>", self.send_text)
+        self.file_button = button(composer, "📎 File", self.choose_file, bg=RAISED, padx=10, pady=8)
+        self.file_button.pack(side="right", padx=(px(8), 0))
         self.send_button = button(composer, "Send", self.send_text, primary=True)
-        self.send_button.pack(side="right", padx=(px(10), 0))
+        self.send_button.pack(side="right", padx=(px(8), 0))
         self.speak_btn = button(composer, "🔊", self._toggle_speak, bg=RAISED, padx=10, pady=8)
         self.speak_btn.pack(side="right", padx=(px(4), 0))
         self.mic_btn = button(composer, "🎤", self._toggle_mic, bg=RAISED, padx=10, pady=8)
@@ -348,6 +361,7 @@ class ChatClient:
             self.entry.insert(0, self.drafts.get(key, ""))
         self.entry.config(state="normal" if allowed else "disabled")
         self.send_button.config(state="normal" if allowed else "disabled")
+        self.file_button.config(state="normal" if allowed else "disabled")
         if key is None:
             self.title.config(text=f"Welcome, {self.name}")
             self.subtitle.config(text="Groups and people online are on the left.")
@@ -504,6 +518,129 @@ class ChatClient:
             self.entry.delete(0, "end")
             self.drafts[self.active] = ""  # the server echo is the only displayed message
 
+    def choose_file(self):
+        if not self.can_send(self.active):
+            return
+        filepath = filedialog.askopenfilename(
+            title="Select file or picture to send",
+            filetypes=[
+                ("All files", "*.*"),
+                ("Images", "*.png;*.gif;*.jpg;*.jpeg;*.webp;*.bmp"),
+                ("Documents", "*.pdf;*.txt;*.docx"),
+            ]
+        )
+        if not filepath:
+            return
+        try:
+            filesize = os.path.getsize(filepath)
+            with open(filepath, "rb") as f:
+                raw_bytes = f.read()
+        except OSError as exc:
+            self.flash(f"Could not open file: {exc}")
+            return
+        if filesize > 10 * 1024 * 1024:
+            self.flash("File exceeds the 10 MB limit")
+            return
+        if filesize == 0:
+            self.flash("Cannot send an empty file")
+            return
+
+        target_type, target = self.active
+        filename = os.path.basename(filepath)
+        file_id = uuid.uuid4().hex[:16]
+        self.file_data_store[file_id] = raw_bytes
+        self.flash(f"Sending {filename}...")
+
+        def upload():
+            ok = self.core.send_file(target_type, target, filepath, file_id=file_id)
+            if not ok:
+                self.file_data_store.pop(file_id, None)
+                self.inbox.put({"type": "error", "text": f"Failed to send '{filename}'"})
+
+        threading.Thread(target=upload, daemon=True).start()
+
+    def format_bytes(self, n):
+        if n >= 1024 * 1024:
+            return f"{n / (1024 * 1024):.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n} B"
+
+    def create_image_thumbnail(self, filename, raw_bytes):
+        if HAS_PIL:
+            try:
+                import io
+                pil_im = Image.open(io.BytesIO(raw_bytes))
+                pil_im.thumbnail((360, 260))
+                return ImageTk.PhotoImage(pil_im)
+            except Exception:
+                pass
+        if filename.lower().endswith((".png", ".gif")):
+            try:
+                b64_str = base64.b64encode(raw_bytes).decode("ascii")
+                img = tk.PhotoImage(data=b64_str)
+                w, h = img.width(), img.height()
+                if w > 360 or h > 260:
+                    factor = max(1, (w + 359) // 360, (h + 259) // 260)
+                    img = img.subsample(factor, factor)
+                return img
+            except Exception:
+                pass
+        return None
+
+    def show_file(self, key, sender, filename, filesize, file_id, raw_bytes=None):
+        box = self.open_room(key)
+        tag = "name:" + sender
+        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
+        box.configure(state="normal")
+        box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time")
+
+        card = tk.Frame(box, bg="#1B1F27", padx=px(14), pady=px(10),
+                        highlightthickness=px(1), highlightbackground=LINE)
+
+        # Image preview for image files
+        is_image = filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp"))
+        if is_image and raw_bytes:
+            img = self.create_image_thumbnail(filename, raw_bytes)
+            if img:
+                self.file_photos.append(img)
+                img_lbl = tk.Label(card, image=img, bg="#1B1F27")
+                img_lbl.pack(anchor="w", pady=(0, px(8)))
+
+        info_row = tk.Frame(card, bg="#1B1F27")
+        info_row.pack(fill="x")
+        icon = "🖼️ " if is_image else "📄 "
+        label(info_row, icon + filename, 10, bold=True).pack(side="left")
+        label(info_row, f" ({self.format_bytes(filesize)})", 9, MUTED).pack(side="left")
+
+        # Save button for recipient or when data is available
+        data_to_save = raw_bytes or self.file_data_store.get(file_id)
+        if data_to_save is not None:
+            def save():
+                dest = filedialog.asksaveasfilename(initialfile=filename, title=f"Save {filename}")
+                if dest:
+                    try:
+                        with open(dest, "wb") as f:
+                            f.write(data_to_save)
+                        self.flash(f"Saved {filename}")
+                    except OSError as err:
+                        self.flash(f"Save failed: {err}")
+            save_btn = button(card, "💾 Save file", save, bg=RAISED, padx=8, pady=4)
+            save_btn.pack(anchor="w", pady=(px(8), 0))
+
+        box.window_create("end", window=card)
+        box.insert("end", "\n\n")
+        box.configure(state="disabled")
+        box.see("end")
+        if key != self.active:
+            self.unread[key] = self.unread.get(key, 0) + 1
+            self.render_sidebar()
+        box.configure(state="disabled")
+        box.see("end")
+        if key != self.active:
+            self.unread[key] = self.unread.get(key, 0) + 1
+            self.render_sidebar()
+
     # ---------- network events (queued by ChatCore's thread) ----------
     def poll(self):
         if self.closed:
@@ -552,6 +689,40 @@ class ChatClient:
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
                 if self.auto_speak:
                     voice.speak(msg["text"])
+        elif kind == "file_start":
+            file_id = msg["file_id"]
+            sender = msg["from"]
+            target_type = msg["target_type"]
+            target = msg["target"]
+            filesize = int(msg["filesize"])
+            filename = msg["filename"]
+            if sender == self.name:
+                room_key = ("pm", target) if target_type == "pm" else ("group", target)
+                raw_bytes = self.file_data_store.get(file_id)
+                self.show_file(room_key, sender, filename, filesize, file_id, raw_bytes=raw_bytes)
+            else:
+                self.incoming_files[file_id] = {"meta": msg, "chunks": {}}
+        elif kind == "file_chunk":
+            file_id = msg["file_id"]
+            if file_id in self.incoming_files:
+                entry = self.incoming_files[file_id]
+                chunk_idx = int(msg["chunk"])
+                entry["chunks"][chunk_idx] = msg["data"]
+                total = int(entry["meta"]["chunks"])
+                if len(entry["chunks"]) >= total:
+                    try:
+                        raw_bytes = b"".join(base64.b64decode(entry["chunks"][i]) for i in range(total))
+                    except Exception:
+                        raw_bytes = b""
+                    self.file_data_store[file_id] = raw_bytes
+                    meta = entry["meta"]
+                    del self.incoming_files[file_id]
+
+                    sender = meta["from"]
+                    target_type = meta["target_type"]
+                    target = meta["target"]
+                    room_key = ("pm", sender) if target_type == "pm" else ("group", target)
+                    self.show_file(room_key, sender, meta["filename"], len(raw_bytes), file_id, raw_bytes=raw_bytes)
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])
