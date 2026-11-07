@@ -59,8 +59,11 @@ class ChatCore:
         if callback is not None:
             callback({"type": "disconnected"})
 
-    def send(self, msg):
-        """True means local transport acceptance, not recipient display."""
+    def send(self, msg, *, wait=.1):
+        """True means local transport acceptance, not recipient display.
+
+        wait: seconds to wait for another send (e.g. a file chunk) to finish; None waits as long as needed.
+        """
         try:
             validate_client_message(msg)
             if msg['type'] in ('pm', 'group_msg') and not msg['text'].strip():
@@ -69,7 +72,7 @@ class ChatCore:
         except (ValueError, TypeError) as exc:
             self._emit({"type": "error", "text": str(exc)})
             return False
-        if not self._send_lock.acquire(blocking=False):
+        if not self._send_lock.acquire(timeout=-1 if wait is None else wait):
             self._emit({'type':'error', 'text':'Another message is being sent. Try again.'})
             return False
         try:
@@ -226,7 +229,7 @@ class ChatCore:
             "filesize": str(filesize),
             "chunks": str(total_chunks),
         }
-        if not self.send(start_msg):
+        if not self.send(start_msg, wait=None):
             return False
 
         with open(filepath, "rb") as f:
@@ -239,7 +242,7 @@ class ChatCore:
                     "chunk": str(index),
                     "data": b64,
                 }
-                if not self.send(chunk_msg):
+                if not self.send(chunk_msg, wait=None):
                     return False
                 if progress_callback:
                     progress_callback(index + 1, total_chunks)

@@ -1,3 +1,4 @@
+import gc
 import tkinter as tk
 import threading
 import time
@@ -9,6 +10,7 @@ from tests.support import pump
 
 class AiClientTests(unittest.TestCase):
     def setUp(self):
+        gc.collect()  # free earlier tests' Tk objects here, on the main thread, not later on a worker (Tcl_AsyncDelete)
         self.root = tk.Tk()
         with patch.object(client, 'ChatCore', return_value=MagicMock()):
             self.app = client.ChatClient(self.root)
