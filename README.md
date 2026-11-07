@@ -10,6 +10,18 @@ A small chat app in Python. One person runs the server and everyone else connect
 - Create groups, join groups, and chat with the group's members
 - Dark desktop UI that stays sharp on high-DPI (scaled) Windows displays
 
+### Chat activities
+
+Type these in any private or group chat. The server picks every result, so everyone in the chat sees the same one.
+
+| Command | Result |
+|---|---|
+| `/coin` | Heads or Tails |
+| `/dice` | A number from 1 to 6 |
+| `/rng` or `/rng <min> <max>` | A random number, 1 to 100 by default |
+| `/poll Question \| option 1 \| option 2` | Starts a poll with 2 to 10 options |
+| `/vote <poll number> <option number>` | Votes in a poll from the same chat; voting again changes your vote |
+
 ## Requirements
 
 - Python 3.10 or newer, with Tkinter (included in the standard Windows and macOS installers)
@@ -56,6 +68,7 @@ they do not establish operation on different physical computers.
 | File | What it does |
 |---|---|
 | `server.py` | TCP server. Tracks online users and groups, and routes messages with a reader and FIFO writer per client. |
+| `activity.py` | Server side of the chat activities (`/coin`, `/dice`, `/rng`, `/poll`, `/vote`). |
 | `chat_core.py` | Client networking with no UI: login, sending, and a background reader. Any front end can reuse it. |
 | `client.py` | Tkinter desktop UI built on `chat_core.py`. |
 | `protocol.py` | Shared schemas, limits, serialized frames and bounded byte reader. |
