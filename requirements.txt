@@ -1,0 +1,6 @@
+edge-tts
+pygame
+numpy
+sounddevice
+requests
+pillow
