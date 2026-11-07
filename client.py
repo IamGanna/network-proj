@@ -630,6 +630,8 @@ class ChatClient:
         self.auto_speak = not self.auto_speak
         self.speak_btn.config(bg=ACCENT if self.auto_speak else RAISED,
                               fg=ON_ACCENT if self.auto_speak else TEXT)
+        if not self.auto_speak and voice:
+            voice.stop()
 
     def send_text(self, _event=None):
         text = self.entry.get().strip()
@@ -825,7 +827,7 @@ class ChatClient:
         elif kind == "pm":
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
-            if self.auto_speak:
+            if self.auto_speak and msg["from"] != self.name:
                 voice.speak(msg["text"])
         elif kind == "group_msg":
             if self.name in self.groups.get(msg["group"], []):

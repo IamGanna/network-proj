@@ -23,7 +23,6 @@ _stream = None
 _frames = []
 _frames_lock = threading.Lock()
 
-# shortcut: queue unbounded, backlog grows if TTS is slower than message rate; cap with maxsize if needed
 _tts_queue = queue.Queue()
 
 
@@ -61,8 +60,19 @@ threading.Thread(target=_tts_worker, daemon=True).start()
 
 
 def speak(text):
-    """Fire-and-forget TTS; queues behind any current playback."""
     _tts_queue.put(text)
+
+
+def stop():
+    """Drain queued TTS and stop any current playback immediately."""
+    while not _tts_queue.empty():
+        try:
+            _tts_queue.get_nowait()
+            _tts_queue.task_done()
+        except queue.Empty:
+            break
+    if pygame.mixer.get_init():
+        pygame.mixer.music.stop()
 
 
 def start_recording():
