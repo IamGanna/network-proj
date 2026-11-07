@@ -4,15 +4,25 @@ Run: python client.py <server-ip> [port]      e.g. python client.py 192.168.1.20
 """
 import ctypes
 import argparse
+import os
 import queue
 import sys
 import threading
 import time
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox
 
 from chat_core import ChatCore
 from protocol import validate_server_event
+import voice
+
+_env = Path(__file__).parent / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 HOST, PORT = "127.0.0.1", 5000
 
@@ -144,6 +154,8 @@ class ChatClient:
         self.active = None
         self.want = None  # group we created/joined: open it once the server confirms membership
         self.flash_job = None
+        self.auto_speak = False
+        self.recording = False
         self.inbox = queue.Queue()  # network thread -> GUI thread (Tkinter is not thread-safe)
         self.build_login()
 
@@ -279,6 +291,10 @@ class ChatClient:
         self.entry.bind("<Return>", self.send_text)
         self.send_button = button(composer, "Send", self.send_text, primary=True)
         self.send_button.pack(side="right", padx=(px(10), 0))
+        self.speak_btn = button(composer, "🔊", self._toggle_speak, bg=RAISED, padx=10, pady=8)
+        self.speak_btn.pack(side="right", padx=(px(4), 0))
+        self.mic_btn = button(composer, "🎤", self._toggle_mic, bg=RAISED, padx=10, pady=8)
+        self.mic_btn.pack(side="right", padx=(px(4), 0))
         self.stage = tk.Frame(self.center, bg=PANEL)
         self.stage.pack(fill="both", expand=True)
         self.empty = label(self.stage, "Pick a group or someone online to start chatting.", 11, MUTED)
@@ -454,6 +470,27 @@ class ChatClient:
         button(btns, "Cancel", dlg.destroy).pack(side="right", padx=(0, px(8)))
         dlg.grab_set()
 
+    def _toggle_mic(self):
+        if not self.recording:
+            self.recording = True
+            self.mic_btn.config(bg=ERROR)
+            voice.start_recording()
+        else:
+            self.recording = False
+            self.mic_btn.config(bg=RAISED)
+            voice.stop_recording(self._on_transcribed)
+
+    def _on_transcribed(self, text):
+        if text and not self.closed:
+            self.root.after(0, lambda: (
+                self.entry.delete(0, "end") or self.entry.insert(0, text)
+            ) if self.entry["state"] == "normal" else None)
+
+    def _toggle_speak(self):
+        self.auto_speak = not self.auto_speak
+        self.speak_btn.config(bg=ACCENT if self.auto_speak else RAISED,
+                              fg=ON_ACCENT if self.auto_speak else TEXT)
+
     def send_text(self, _event=None):
         text = self.entry.get().strip()
         if not text or not self.can_send(self.active):
@@ -508,9 +545,13 @@ class ChatClient:
         elif kind == "pm":
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
+            if self.auto_speak:
+                voice.speak(msg["text"])
         elif kind == "group_msg":
             if self.can_send(("group", msg["group"])):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
+                if self.auto_speak:
+                    voice.speak(msg["text"])
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])
