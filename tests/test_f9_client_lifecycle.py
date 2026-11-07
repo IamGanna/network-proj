@@ -123,20 +123,34 @@ print('closed Tk worker-GC regression passed')
             app.close()
 
     def test_login_rejection_then_retry(self):
+        connections = []
+        completed = {name: threading.Event() for name in ('Alice', 'Bob')}
         def reject(conn, _addr):
+            connections.append(conn)
             with conn.makefile("r", encoding="utf-8") as reader:
-                self.assertEqual(json.loads(reader.readline())["name"], "Alice")
-                conn.sendall(frame({"type": "error", "text": "Name already taken"}))
-                self.assertEqual(json.loads(reader.readline())["name"], "Bob")
-                conn.sendall(frame({"type": "login_ok", "name": "Bob"}))
-                reader.read()
+                name = json.loads(reader.readline())["name"]
+                if name == 'Alice':
+                    conn.sendall(frame({"type": "error", "text": "Name already taken"}))
+                    self.assertEqual(reader.read(), '')
+                    completed[name].set()
+                    return
+                self.assertEqual(name, 'Bob')
+                conn.sendall(frame({"type": "login_ok", "name": name}))
+                self.assertEqual(reader.read(), '')
+                completed[name].set()
         with LoopbackServer(reject) as peer:
             core = ChatCore("127.0.0.1", peer.port)
             try:
                 self.assertEqual(core.login("Alice"), (False, "Name already taken"))
+                self.assertIsNone(core.sock)
                 self.assertEqual(core.login("Bob"), (True, "Bob"))
+                self.assertEqual(len(connections), 2)
+                self.assertIsNot(connections[0], connections[1])
             finally:
                 core.close()
+            # Wait for the peer's EOF reads before the fixture shuts down its
+            # sockets locally; Windows may otherwise raise WSAESHUTDOWN in read.
+            self.assertTrue(all(event.wait(1) for event in completed.values()))
 
     def test_trickled_login_has_absolute_response_deadline(self):
         def trickle(conn, _addr):

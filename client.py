@@ -7,7 +7,6 @@ import ctypes
 import argparse
 import os
 import queue
-import sys
 import threading
 import time
 import uuid
@@ -22,7 +21,7 @@ except ImportError:
     HAS_PIL = False
 
 from chat_core import ChatCore
-from protocol import validate_server_event
+from protocol import validate_server_event, AI_MAX_INSTRUCTION
 try:
     import voice
 except ImportError:
@@ -174,6 +173,13 @@ class ChatClient:
         self.flash_job = None
         self.auto_speak = False
         self.recording = False
+        self.sidebar_pending = False
+        self.pending_ai = None
+        self.ai_dialogs = set()
+        self.instruction_dialog = None
+        self.ai_send_worker = None
+        self.ai_send_results = queue.Queue()
+        self.ai_send_job = None
         self.inbox = queue.Queue()  # network thread -> GUI thread (Tkinter is not thread-safe)
         self.build_login()
 
@@ -194,7 +200,7 @@ class ChatClient:
         self.name_entry.pack(fill="x", ipady=px(8))
         self.name_entry.bind("<Return>", self.login)
         self.name_entry.focus_set()
-        self.login_error = label(card, "", 10, ERROR)
+        self.login_error = label(card, "", 10, ERROR, wraplength=px(350), justify="left")
         self.login_error.pack(anchor="w", pady=(px(6), 0))
         self.login_button = button(card, "Join server", self.login, primary=True)
         self.login_button.pack(fill="x", pady=(px(8), 0))
@@ -245,10 +251,23 @@ class ChatClient:
         if self.closed:
             return
         self.closed = True
+        if self.pending_ai is not None:
+            timer = self.pending_ai.get('timer')
+            if timer is not None:
+                self.root.after_cancel(timer)
+            self.pending_ai = None
+        for dialog in tuple(self.ai_dialogs):
+            dialog.destroy()
+        self.ai_dialogs.clear()
+        if self.ai_send_job is not None:
+            self.root.after_cancel(self.ai_send_job)
+            self.ai_send_job = None
         for job in (self.login_job, self.poll_job, self.flash_job):
             if job is not None:
                 self.root.after_cancel(job)
         self.core.close()
+        if self.ai_send_worker is not None:
+            self.ai_send_worker.join(timeout=1)
         if self.login_worker is not None:
             self.login_worker.join(timeout=1)
         self.root.destroy()
@@ -315,6 +334,17 @@ class ChatClient:
         self.speak_btn.pack(side="right", padx=(px(4), 0))
         self.mic_btn = button(composer, "🎤", self._toggle_mic, bg=RAISED, padx=10, pady=8)
         self.mic_btn.pack(side="right", padx=(px(4), 0))
+        ai_row = tk.Frame(self.center, bg=PANEL, padx=px(24), pady=px(6))
+        ai_row.pack(side='bottom', fill='x')
+        self.summary_button = button(ai_row, 'Summarize', lambda: self.start_ai('summary'), pady=6)
+        self.summary_button.pack(side='left')
+        self.draft_button = button(ai_row, 'Draft reply', self.draft_reply, pady=6)
+        self.draft_button.pack(side='left', padx=px(8))
+        self.ai_status = label(ai_row, '', 9, DIM, wraplength=px(260), justify='left')
+        self.ai_status.pack(side='left', fill='x', expand=True)
+        self.ai_disclosure = label(self.center, 'AI sends this chat’s session messages to OpenRouter and its model provider.',
+                                   9, DIM, wraplength=px(500), justify='left')
+        self.ai_disclosure.pack(side='bottom', anchor='w', padx=px(24))
         self.stage = tk.Frame(self.center, bg=PANEL)
         self.stage.pack(fill="both", expand=True)
         self.empty = label(self.stage, "Pick a group or someone online to start chatting.", 11, MUTED)
@@ -347,21 +377,21 @@ class ChatClient:
             fg = color_for(sender)
         box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(12))  # gap above each message, not below every line
         box.configure(state="normal")
-        box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
+        box.insert("end", sender, (tag,), "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
         box.configure(state="disabled")
         box.see("end")
         if key != self.active:
             self.unread[key] = self.unread.get(key, 0) + 1
-            self.render_sidebar()
+            if not self.sidebar_pending:
+                self.sidebar_pending = True
+                self.root.after_idle(self.flush_sidebar)
+
+    def flush_sidebar(self):
+        self.sidebar_pending = False
+        self.render_sidebar()
 
     def is_my_timeout_active(self, group):
-        exp = self.my_timeouts.get(group)
-        if exp is None:
-            return False
-        if time.time() >= exp:
-            self.my_timeouts.pop(group, None)
-            return False
-        return True
+        return time.time() < self.my_timeouts.get(group, 0)
 
     def format_remaining(self, seconds):
         if seconds >= 86400:
@@ -400,7 +430,6 @@ class ChatClient:
             self.entry.insert(0, self.drafts.get(key, ""))
         self.entry.config(state="normal" if allowed else "disabled")
         self.send_button.config(state="normal" if allowed else "disabled")
-        self.file_button.config(state="normal" if allowed else "disabled")
         if key is None:
             self.title.config(text=f"Welcome, {self.name}")
             self.subtitle.config(text="Groups and people online are on the left.")
@@ -426,6 +455,172 @@ class ChatClient:
                 self.entry.focus_set()
         self.render_sidebar()
         self.render_members()
+        self.refresh_ai_controls()
+
+    def refresh_ai_controls(self):
+        allowed = self.can_send(self.active)
+        frozen = bool(self.pending_ai and self.pending_ai['action'] == 'draft'
+                      and self.pending_ai['room'] == self.active)
+        self.entry.config(state='normal' if allowed and not frozen else 'disabled')
+        self.send_button.config(state='normal' if allowed and not frozen else 'disabled')
+        self.file_button.config(state='normal' if allowed else 'disabled')
+        writing = self.ai_send_worker is not None and self.ai_send_worker.is_alive()
+        state = 'normal' if allowed and self.pending_ai is None and not writing and self.instruction_dialog is None else 'disabled'
+        self.summary_button.config(state=state)
+        self.draft_button.config(state=state)
+        self.ai_status.config(text=('Generating ' + ('summary' if self.pending_ai['action']=='summary' else 'reply')
+                                   + ' for ' + self.pending_ai['room'][1] + '…') if self.pending_ai else '')
+
+    def start_ai(self, action, instruction='', *, room=None):
+        room = self.active if room is None else room
+        if self.closed or self.pending_ai is not None or not self.can_send(room):
+            return False
+        if self.instruction_dialog is not None:
+            self.flash('Finish or cancel the draft instruction first.')
+            return False
+        if self.ai_send_worker is not None and self.ai_send_worker.is_alive():
+            self.flash('An AI request is still being sent. Try again shortly.')
+            return False
+        if action not in ('summary', 'draft') or len(instruction) > AI_MAX_INSTRUCTION:
+            self.flash('AI instruction must be at most 500 characters.')
+            return False
+        original = self.entry.get() if room == self.active else self.drafts.get(room, '')
+        self.drafts[room] = original
+        pending = dict(request_id=uuid.uuid4().hex, room=room, action=action,
+                       original_draft=original, timer=None)
+        self.pending_ai = pending
+        self.refresh_ai_controls()
+        pending['timer'] = self.root.after(35000, lambda: self.finish_ai_error('AI timed out. Your draft was kept.'))
+        def write_request():
+            try:
+                sent = self.core.request_ai(pending['request_id'], action, room[0], room[1], instruction)
+            except Exception:
+                sent = False
+            self.ai_send_results.put((pending['request_id'], sent))
+        self.ai_send_worker = threading.Thread(target=write_request, daemon=True, name='ai-request-write')
+        self.ai_send_worker.start()
+        if self.ai_send_job is None:
+            self.ai_send_job = self.root.after(25, self._poll_ai_send)
+        return True
+
+    def _poll_ai_send(self):
+        self.ai_send_job = None
+        if self.closed:
+            return
+        while not self.ai_send_results.empty():
+            rid, sent = self.ai_send_results.get_nowait()
+            if not sent and self.pending_ai and self.pending_ai['request_id'] == rid:
+                self.finish_ai_error('Could not request AI. Your draft was kept.')
+        if self.ai_send_worker is not None and not self.ai_send_worker.is_alive():
+            self.ai_send_worker = None
+        self.refresh_ai_controls()
+        if self.ai_send_worker is not None:
+            self.ai_send_job = self.root.after(25, self._poll_ai_send)
+
+    def _clear_ai(self):
+        pending, self.pending_ai = self.pending_ai, None
+        if pending and pending['timer'] is not None:
+            self.root.after_cancel(pending['timer'])
+        return pending
+
+    def _replace_draft(self, room, text):
+        self.drafts[room] = text
+        if self.active == room:
+            self.entry.config(state='normal')
+            self.entry.delete(0, 'end')
+            self.entry.insert(0, text)
+            self.entry.icursor('end')
+
+    def finish_ai_error(self, text):
+        pending = self._clear_ai()
+        if pending and pending['action'] == 'draft':
+            self._replace_draft(pending['room'], pending['original_draft'])
+        self.refresh_ai_controls()
+        self.flash(text)
+
+    def handle_ai(self, msg):
+        pending = self.pending_ai
+        if not pending or any((msg['request_id'] != pending['request_id'], msg['action'] != pending['action'],
+                               (msg['room_type'],msg['room']) != pending['room'])):
+            return
+        if msg['type'] == 'ai_error':
+            self.finish_ai_error(msg['text'])
+            return
+        if not self.can_send(pending['room']):
+            self.finish_ai_error('You no longer have access to that chat.')
+            return
+        self._clear_ai()
+        if pending['action'] == 'draft':
+            self._replace_draft(pending['room'], msg['text'])
+        else:
+            self.show_summary(msg)
+        self.refresh_ai_controls()
+
+    def _ai_dialog(self, title):
+        dialog = tk.Toplevel(self.root, bg=PANEL, padx=px(20), pady=px(16))
+        dialog.title(title)
+        dialog.transient(self.root)
+        self.ai_dialogs.add(dialog)
+        def dismiss():
+            self.ai_dialogs.discard(dialog)
+            if self.instruction_dialog is dialog:
+                self.instruction_dialog = None
+            dialog.destroy()
+            if not self.closed:
+                self.refresh_ai_controls()
+                self.entry.focus_set()
+        dialog.protocol('WM_DELETE_WINDOW', dismiss)
+        dialog.bind('<Escape>', lambda _event: dismiss())
+        return dialog, dismiss
+
+    def draft_reply(self):
+        if self.closed or self.pending_ai or not self.can_send(self.active):
+            return
+        if self.instruction_dialog is not None:
+            self.instruction_dialog.lift()
+            return
+        room = self.active  # Generate must still target this room after switching.
+        dialog, dismiss = self._ai_dialog('Draft reply · ' + room[1])
+        self.instruction_dialog = dialog
+        label(dialog, 'Optional instruction', 13, bold=True).pack(anchor='w')
+        label(dialog, 'Keep blank to use the conversation. Replaces your draft; you press Send.',
+              10, MUTED, wraplength=px(380), justify='left').pack(anchor='w', pady=px(8))
+        instruction = entry(dialog)
+        instruction.pack(fill='x', ipady=px(8))
+        instruction.focus_set()
+        def generate(_event=None):
+            text = instruction.get()
+            if len(text) > AI_MAX_INSTRUCTION:
+                self.flash('AI instruction must be at most 500 characters.')
+                return
+            dismiss()
+            self.start_ai('draft', text, room=room)
+        controls = tk.Frame(dialog, bg=PANEL)
+        controls.pack(fill='x', pady=(px(12),0))
+        self.instruction_generate = button(controls, 'Generate', generate, primary=True)
+        self.instruction_generate.pack(side='right')
+        button(controls, 'Cancel', dismiss).pack(side='right', padx=px(8))
+        instruction.bind('<Return>', generate)
+        self.refresh_ai_controls()
+
+    def show_summary(self, msg):
+        dialog, dismiss = self._ai_dialog('Summary · ' + msg['room'])
+        dialog.geometry(f'{px(600)}x{px(430)}')
+        label(dialog, msg['room_type'].upper() + ' · ' + msg['room'], 13, bold=True).pack(anchor='w')
+        label(dialog, f"Private to you · {msg['message_count']} messages · through session message #{msg['cutoff']}",
+              9, DIM).pack(anchor='w', pady=px(8))
+        button(dialog, 'Close', dismiss).pack(side='bottom', anchor='e', pady=(px(10),0))
+        area = tk.Frame(dialog, bg=PANEL)
+        area.pack(fill='both', expand=True)
+        scrollbar = tk.Scrollbar(area)
+        scrollbar.pack(side='right', fill='y')
+        box = tk.Text(area, bg=BG, fg=TEXT, font=(FONT,11), wrap='word',
+                      relief='flat', padx=px(12), pady=px(12), yscrollcommand=scrollbar.set)
+        box.pack(fill='both', expand=True)
+        scrollbar.config(command=box.yview)
+        box.insert('1.0', msg['text'])
+        box.config(state='disabled')
+        box.focus_set()
 
     def join_selected(self):
         if self.active and self.active[0] == "group":
@@ -463,6 +658,9 @@ class ChatClient:
             key = ("pm", u)
             display_name = u + " (you)" if u == self.name else u
             self.row(self.user_box, display_name, lambda k=key: self.select(k), key, person=u)
+        for kind, u in self.rooms:
+            if kind == "pm" and u not in self.users:
+                self.row(self.user_box, u, lambda k=("pm", u): self.select(k), ("pm", u), "offline", u)
         if not self.users:
             label(self.user_box, "No one is online yet.", 9, DIM).pack(anchor="w", padx=px(6))
         for area in (self.group_list, self.user_list):
@@ -634,10 +832,15 @@ class ChatClient:
             voice.stop()
 
     def send_text(self, _event=None):
+        if self.pending_ai and self.pending_ai['action']=='draft' and self.pending_ai['room']==self.active:
+            return
         text = self.entry.get().strip()
         if not text or not self.can_send(self.active):
             return
         kind, name = self.active
+        if kind == "pm" and name not in self.users:
+            self.flash(f"{name} is offline")
+            return
         if kind == "pm":
             sent = self.core.pm(name, text)
         else:
@@ -773,28 +976,35 @@ class ChatClient:
     def poll(self):
         if self.closed:
             return
-        while not self.inbox.empty():
-            self.handle(self.inbox.get())
-            if self.closed:
-                return
-        self.check_timeout_countdown()
-        self.poll_job = self.root.after(100, self.poll)
+        try:
+            while not self.inbox.empty():
+                self.handle(self.inbox.get())
+                if self.closed:
+                    return
+            self.check_timeout_countdown()
+        finally:
+            if not self.closed:  # an error still reaches Tk's report; later messages keep arriving
+                self.poll_job = self.root.after(100, self.poll)
 
     def check_timeout_countdown(self):
-        if self.active and self.active[0] == "group":
-            g = self.active[1]
-            if self.is_my_timeout_active(g):
-                rem = int(self.my_timeouts[g] - time.time())
-                if rem > 0:
-                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
-                    self.entry.config(state="disabled")
-                    self.send_button.config(state="disabled")
-                else:
-                    self.my_timeouts.pop(g, None)
-                    self.entry.config(state="normal")
-                    self.send_button.config(state="normal")
-                    self.subtitle.config(text="Only members see these messages")
-                    self.render_members()
+        if not self.active or self.active[0] != "group":
+            return
+        g = self.active[1]
+        expiry = self.my_timeouts.get(g)
+        if expiry is None:
+            return
+        remaining = expiry - time.time()
+        if remaining > 0:
+            if self.name in self.groups.get(g, []):
+                rem = max(1, int(remaining))
+                self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+            return
+        self.my_timeouts.pop(g, None)
+        self.group_timeouts.get(g, {}).pop(self.name, None)
+        if self.name in self.groups.get(g, []):
+            self.subtitle.config(text="Only members see these messages")
+        self.refresh_ai_controls()
+        self.render_members()
 
     def handle(self, msg):
         try:
@@ -803,11 +1013,16 @@ class ChatClient:
             self.flash(f"Invalid server event: {exc}")
             return
         kind = msg["type"]
-        if kind == "users":  # R4
+        if kind in ('ai_result', 'ai_error'):
+            self.handle_ai(msg)
+        elif kind == "users":  # R4
             self.users = msg["users"]
             self.render_sidebar()
         elif kind == "groups":  # R9
+            could_send = self.can_send(self.active)
             self.groups = msg["groups"]
+            if self.pending_ai and self.pending_ai['room'][0]=='group' and not self.can_send(self.pending_ai['room']):
+                self.finish_ai_error('You no longer have access to that group.')
             for g, members in self.groups.items():
                 if self.name in members:
                     self.open_room(("group", g))
@@ -819,11 +1034,12 @@ class ChatClient:
                     if self.want == self.active:
                         self.want = None
                     self.select(None)
-                elif self.active and self.active[0] == "group":
+                elif self.active and self.active[0] == "group" and could_send != self.can_send(self.active):
                     self.select(self.active)
                 else:
                     self.render_sidebar()
                     self.render_members()
+                    self.refresh_ai_controls()
         elif kind == "pm":
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
@@ -884,37 +1100,8 @@ class ChatClient:
                 if target == self.name:
                     self.my_timeouts[g] = exp
             if self.active and self.active == ("group", g):
-                allowed = self.can_send(self.active)
-                self.entry.config(state="normal" if allowed else "disabled")
-                self.send_button.config(state="normal" if allowed else "disabled")
-                if self.is_my_timeout_active(g):
-                    rem = max(1, int(self.my_timeouts[g] - time.time()))
-                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
-                elif self.name in self.groups.get(g, []):
-                    self.subtitle.config(text="Only members see these messages")
-            self.render_members()
-        elif kind == "timeout_notice":
-            g = msg["group"]
-            target = msg["target"]
-            try:
-                secs = int(msg.get("seconds", 0))
-            except (ValueError, TypeError):
-                secs = 0
-            if secs <= 0:
-                if g in self.group_timeouts:
-                    self.group_timeouts[g].pop(target, None)
-                if target == self.name:
-                    self.my_timeouts.pop(g, None)
-            else:
-                exp = time.time() + secs
-                self.group_timeouts.setdefault(g, {})[target] = exp
-                if target == self.name:
-                    self.my_timeouts[g] = exp
-            if self.active and self.active == ("group", g):
-                allowed = self.can_send(self.active)
-                self.entry.config(state="normal" if allowed else "disabled")
-                self.send_button.config(state="normal" if allowed else "disabled")
-                if self.is_my_timeout_active(g):
+                self.refresh_ai_controls()
+                if self.name in self.groups.get(g, []) and self.is_my_timeout_active(g):
                     rem = max(1, int(self.my_timeouts[g] - time.time()))
                     self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
                 elif self.name in self.groups.get(g, []):

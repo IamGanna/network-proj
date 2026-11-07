@@ -86,7 +86,7 @@ class ResourceTests(unittest.TestCase):
         self.assertEqual((protocol.MAX_FRAME_BYTES, protocol.MAX_TEXT_CHARS,
                           protocol.MAX_NAME_CHARS, protocol.MAX_SESSIONS,
                           protocol.MAX_GROUPS, protocol.OUTBOUND_QUEUE_FRAMES,
-                          protocol.LOGIN_TIMEOUT), (65536, 4096, 64, 32, 64, 64, 10))
+                          protocol.LOGIN_TIMEOUT), (65536, 4096, 64, 32, 64, 1024, 10))
         for command in ({'type': 'login', 'name': 'a' * 65},
                         {'type': 'create_group', 'group': 'ก' * 65},
                         {'type': 'pm', 'to': 'Bob', 'text': 'x' * 4097}):
