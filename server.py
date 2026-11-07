@@ -8,6 +8,7 @@ import socket
 import threading
 import time
 
+import activity
 from protocol import (FrameReader, encode_frame, validate_client_message,
                       MAX_SESSIONS, MAX_GROUPS, OUTBOUND_QUEUE_FRAMES, LOGIN_TIMEOUT)
 
@@ -117,6 +118,7 @@ def disconnect_sessions(pending):
                             del groups[group]
                             group_creators.pop(group, None)
                             group_timeouts.pop(group, None)
+                            activity.forget(("group", group))
                         elif group_creators.get(group) == name:
                             group_creators[group] = groups[group][0]
                 if not clients:
@@ -177,6 +179,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     if to not in clients:
                         send(session, {"type": "error", "text": f"{to} is offline"}, failed)
                     else:
+                        msg["text"] = activity.apply(name, ("pm", frozenset((name, to))), msg["text"])
                         out = {"type": "pm", "from": name, "to": to, "text": msg["text"]}
                         try:
                             output = encode(out)
@@ -239,6 +242,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                         else:
                             if name in timeouts and now >= timeouts[name]:
                                 del timeouts[name]
+                            msg["text"] = activity.apply(name, ("group", g), msg["text"])
                             out = {"type": "group_msg", "group": g, "from": name, "text": msg["text"]}
                             try:
                                 output = encode(out)
