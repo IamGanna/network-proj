@@ -80,10 +80,10 @@ def start_recording():
 
 
 def stop_recording(on_done):
-    """Stop recording, transcribe, call on_done(text) on a background thread."""
+    """Stop recording, transcribe, call on_done(text, error) on a background thread."""
     global _stream
     if _stream is None:
-        on_done("")
+        on_done("", None)
         return
 
     _stream.stop()
@@ -96,7 +96,11 @@ def stop_recording(on_done):
     def _transcribe():
         try:
             if not frames:
-                on_done("")
+                on_done("", None)
+                return
+            key = os.getenv("TYPHOON_API_KEY", "")
+            if not key:
+                on_done("", "TYPHOON_API_KEY is not set")
                 return
             audio = np.concatenate(frames, axis=0)
             buf = io.BytesIO()
@@ -106,7 +110,6 @@ def stop_recording(on_done):
                 w.setframerate(_SR)
                 w.writeframes(audio.tobytes())
             buf.seek(0)
-            key = os.getenv("TYPHOON_API_KEY", "")
             r = requests.post(
                 _TYPHOON_URL,
                 headers={"Authorization": f"Bearer {key}"},
@@ -114,9 +117,10 @@ def stop_recording(on_done):
                 data={"model": "typhoon-asr-edge"},
                 timeout=15,
             )
-            on_done(r.json().get("text", ""))
+            r.raise_for_status()
+            on_done(r.json().get("text", ""), None)
         except Exception as e:
             print(f"[voice] STT error: {e}")
-            on_done("")
+            on_done("", str(e))
 
     threading.Thread(target=_transcribe, daemon=True).start()

@@ -607,14 +607,19 @@ class ChatClient:
             voice.start_recording()
         else:
             self.recording = False
-            self.mic_btn.config(bg=RAISED)
+            self.mic_btn.config(text="⏳", bg=RAISED)
             voice.stop_recording(self._on_transcribed)
 
-    def _on_transcribed(self, text):
-        if text and not self.closed:
-            self.root.after(0, lambda: (
+    def _on_transcribed(self, text, error):
+        if self.closed:
+            return
+        def _update():
+            self.mic_btn.config(text="🎤")
+            if error:
+                self.flash(f"STT error: {error}")
+            elif text and self.entry["state"] == "normal":
                 self.entry.insert("end", (" " + text) if self.entry.get() else text)
-            ) if self.entry["state"] == "normal" else None)
+        self.root.after(0, _update)
 
     def _toggle_speak(self):
         self.auto_speak = not self.auto_speak
