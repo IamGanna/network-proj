@@ -271,6 +271,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                             send(session, {"type": "error", "text": f"{target} is offline"}, failed)
                         elif target_type == "group" and (target not in groups or name not in groups[target]):
                             send(session, {"type": "error", "text": f"You are not a member of '{target}'"}, failed)
+                        elif target_type == "group" and name in group_timeouts.get(target, {}) and time.time() < group_timeouts[target][name]:
+                            send(session, {"type": "error", "text": f"You are timed out in '{target}'"}, failed)
                         else:
                             out = {
                                 "type": "file_start",

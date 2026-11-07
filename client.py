@@ -161,6 +161,8 @@ class ChatClient:
         self.file_photos = []  # retain PhotoImage references
         self.group_timeouts = {}  # group -> {member: expiry_timestamp}
         self.my_timeouts = {}     # group -> expiry_timestamp
+        self.group_timeouts = {}  # group -> {member: expiry_timestamp}
+        self.my_timeouts = {}     # group -> expiry_timestamp
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
@@ -825,8 +827,6 @@ class ChatClient:
         elif kind == "group_msg":
             if self.name in self.groups.get(msg["group"], []):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
-                if self.auto_speak:
-                    voice.speak(msg["text"])
         elif kind == "file_start":
             file_id = msg["file_id"]
             sender = msg["from"]
@@ -861,6 +861,33 @@ class ChatClient:
                     target = meta["target"]
                     room_key = ("pm", sender) if target_type == "pm" else ("group", target)
                     self.show_file(room_key, sender, meta["filename"], len(raw_bytes), file_id, raw_bytes=raw_bytes)
+        elif kind == "timeout_notice":
+            g = msg["group"]
+            target = msg["target"]
+            try:
+                secs = int(msg.get("seconds", 0))
+            except (ValueError, TypeError):
+                secs = 0
+            if secs <= 0:
+                if g in self.group_timeouts:
+                    self.group_timeouts[g].pop(target, None)
+                if target == self.name:
+                    self.my_timeouts.pop(g, None)
+            else:
+                exp = time.time() + secs
+                self.group_timeouts.setdefault(g, {})[target] = exp
+                if target == self.name:
+                    self.my_timeouts[g] = exp
+            if self.active and self.active == ("group", g):
+                allowed = self.can_send(self.active)
+                self.entry.config(state="normal" if allowed else "disabled")
+                self.send_button.config(state="normal" if allowed else "disabled")
+                if self.is_my_timeout_active(g):
+                    rem = max(1, int(self.my_timeouts[g] - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+                elif self.name in self.groups.get(g, []):
+                    self.subtitle.config(text="Only members see these messages")
+            self.render_members()
         elif kind == "timeout_notice":
             g = msg["group"]
             target = msg["target"]
