@@ -2,14 +2,22 @@
 
 Run: python client.py <server-ip> [port]      e.g. python client.py 192.168.1.20
 """
+import base64
 import ctypes
 import argparse
+import os
 import queue
 import threading
 import time
 import uuid
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import filedialog, messagebox
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
 
 from chat_core import ChatCore
 from protocol import validate_server_event, AI_MAX_INSTRUCTION
@@ -138,6 +146,11 @@ class ChatClient:
 
         self.users = []
         self.groups = {}
+        self.incoming_files = {}  # file_id -> {"meta": msg, "chunks": {}}
+        self.file_data_store = {}  # file_id -> raw_bytes
+        self.file_photos = []  # retain PhotoImage references
+        self.group_timeouts = {}  # group -> {member: expiry_timestamp}
+        self.my_timeouts = {}     # group -> expiry_timestamp
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
@@ -297,8 +310,10 @@ class ChatClient:
         self.entry = entry(composer)  # chat box (R6)
         self.entry.pack(side="left", fill="x", expand=True, ipady=px(10))
         self.entry.bind("<Return>", self.send_text)
+        self.file_button = button(composer, "📎 File", self.choose_file, bg=RAISED, padx=10, pady=8)
+        self.file_button.pack(side="right", padx=(px(8), 0))
         self.send_button = button(composer, "Send", self.send_text, primary=True)
-        self.send_button.pack(side="right", padx=(px(10), 0))
+        self.send_button.pack(side="right", padx=(px(8), 0))
         ai_row = tk.Frame(self.center, bg=PANEL, padx=px(24), pady=px(6))
         ai_row.pack(side='bottom', fill='x')
         self.summary_button = button(ai_row, 'Summarize', lambda: self.start_ai('summary'), pady=6)
@@ -334,7 +349,13 @@ class ChatClient:
     def show(self, key, sender, text):
         box = self.open_room(key)
         tag = "name:" + sender
-        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
+        if sender == "[System]":
+            fg = "#FF9B8A"
+        elif sender == self.name:
+            fg = ACCENT
+        else:
+            fg = color_for(sender)
+        box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"))
         box.configure(state="normal")
         box.insert("end", sender, (tag,), "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
         box.configure(state="disabled")
@@ -349,11 +370,31 @@ class ChatClient:
         self.sidebar_pending = False
         self.render_sidebar()
 
+    def is_my_timeout_active(self, group):
+        return time.time() < self.my_timeouts.get(group, 0)
+
+    def format_remaining(self, seconds):
+        if seconds >= 86400:
+            return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+        if seconds >= 3600:
+            return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+        if seconds >= 60:
+            return f"{seconds // 60}m {seconds % 60}s"
+        return f"{seconds}s"
+
     def can_send(self, key):
         if not key:
             return False
         kind, name = key
-        return kind == "pm" or (kind == "group" and self.name in self.groups.get(name, []))
+        if kind == "pm":
+            return True
+        if kind == "group":
+            if self.name not in self.groups.get(name, []):
+                return False
+            if self.is_my_timeout_active(name):
+                return False
+            return True
+        return False
 
     def select(self, key):
         if key and key[0] == "group" and key[1] not in self.groups:
@@ -377,9 +418,15 @@ class ChatClient:
             kind, name = key
             self.title.config(text=("#  " if kind == "group" else "@  ") + name)
             if kind == "group" and not allowed:
-                self.subtitle.config(text="Public membership preview · You have not joined")
-                self.preview.tkraise()
-                self.join_button.pack(anchor="w", pady=(px(6), 0))
+                if self.name not in self.groups.get(name, []):
+                    self.subtitle.config(text="Public membership preview · You have not joined")
+                    self.preview.tkraise()
+                    self.join_button.pack(anchor="w", pady=(px(6), 0))
+                else:
+                    self.unread.pop(key, None)
+                    self.open_room(key).tkraise()
+                    rem = max(1, int(self.my_timeouts.get(name, time.time()) - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
             else:
                 self.unread.pop(key, None)
                 self.open_room(key).tkraise()
@@ -396,6 +443,7 @@ class ChatClient:
                       and self.pending_ai['room'] == self.active)
         self.entry.config(state='normal' if allowed and not frozen else 'disabled')
         self.send_button.config(state='normal' if allowed and not frozen else 'disabled')
+        self.file_button.config(state='normal' if allowed else 'disabled')
         writing = self.ai_send_worker is not None and self.ai_send_worker.is_alive()
         state = 'normal' if allowed and self.pending_ai is None and not writing and self.instruction_dialog is None else 'disabled'
         self.summary_button.config(state=state)
@@ -605,17 +653,93 @@ class ChatClient:
         if not self.active or self.active[0] != "group" or self.active[1] not in self.groups:
             self.members_panel.pack_forget()
             return
-        members = self.groups[self.active[1]]
+        g = self.active[1]
+        members = self.groups[g]
+        owner = members[0] if members else None
+        is_owner = (self.name == owner)
+        timeouts = self.group_timeouts.get(g, {})
+        now = time.time()
+
         label(self.members_panel, f"MEMBERS · {len(members)}", 9, MUTED, bold=True).pack(anchor="w", pady=(0, px(8)))
         self.member_list = ScrollList(self.members_panel)
         self.member_list.pack(fill="both", expand=True)
         for m in members:
             r = tk.Frame(self.member_list.content, bg=PANEL, pady=px(5))
             r.pack(fill="x")
-            avatar(r, m).pack(side="left", padx=(0, px(10)))
+            avatar(r, m).pack(side="left", padx=(0, px(8)))
             label(r, m + (" (you)" if m == self.name else ""), 10).pack(side="left")
+            if m == owner:
+                tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
+                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+            is_timed_out = (m in timeouts and now < timeouts[m])
+            if is_timed_out:
+                tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
+                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+            if is_owner and m != self.name:
+                btn_txt = "Manage" if is_timed_out else "Timeout"
+                btn = tk.Button(r, text=btn_txt, command=lambda target=m: self.open_timeout_dialog(target),
+                                relief="flat", bd=0, cursor="hand2", bg=RAISED, fg=TEXT,
+                                activebackground=LINE, activeforeground=TEXT,
+                                font=(FONT, 8, "bold"), padx=px(6), pady=px(2))
+                btn.pack(side="right")
             self.member_list.bind_controls(r)
         self.members_panel.pack(side="right", fill="y", padx=(px(8), 0), before=self.center)
+
+    def open_timeout_dialog(self, target):
+        if not self.active or self.active[0] != "group":
+            return
+        g = self.active[1]
+        dlg = tk.Toplevel(self.root, bg=PANEL, padx=px(24), pady=px(20))
+        dlg.title(f"Timeout {target}")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        label(dlg, f"Timeout {target}", 14, bold=True).pack(anchor="w")
+        label(dlg, f"Select how long {target} will be unable to send messages in #{g}.",
+              10, MUTED, wraplength=px(320), justify="left").pack(anchor="w", pady=(px(4), px(12)))
+
+        timeouts = self.group_timeouts.get(g, {})
+        now = time.time()
+        is_currently_timed_out = target in timeouts and now < timeouts[target]
+        if is_currently_timed_out:
+            rem = max(1, int(timeouts[target] - now))
+            status_box = tk.Frame(dlg, bg="#2A1E1E", padx=px(10), pady=px(8))
+            status_box.pack(fill="x", pady=(0, px(12)))
+            label(status_box, f"Currently timed out ({self.format_remaining(rem)} remaining)",
+                  9, ERROR, bold=True).pack(anchor="w")
+
+        dur_var = tk.StringVar(value="60")
+        options = [
+            ("60 seconds (1 minute)", "60"),
+            ("5 minutes", "300"),
+            ("10 minutes", "600"),
+            ("1 hour", "3600"),
+            ("1 day", "86400"),
+            ("1 week", "604800"),
+        ]
+
+        opts_frame = tk.Frame(dlg, bg=PANEL)
+        opts_frame.pack(fill="x", pady=(0, px(16)))
+
+        for text, val in options:
+            rb = tk.Radiobutton(opts_frame, text=text, value=val, variable=dur_var,
+                                bg=PANEL, fg=TEXT, selectcolor=BG, activebackground=PANEL,
+                                activeforeground=TEXT, font=(FONT, 10), cursor="hand2")
+            rb.pack(anchor="w", pady=px(2))
+
+        btns = tk.Frame(dlg, bg=PANEL)
+        btns.pack(fill="x", pady=(px(8), 0))
+
+        def apply_timeout(duration):
+            self.core.timeout_member(g, target, duration)
+            dlg.destroy()
+
+        button(btns, "Apply Timeout", lambda: apply_timeout(dur_var.get()), primary=True).pack(side="right")
+        if is_currently_timed_out:
+            button(btns, "Remove Timeout", lambda: apply_timeout("0"), bg="#3A2320").pack(side="right", padx=(0, px(8)))
+        button(btns, "Cancel", dlg.destroy).pack(side="right", padx=(0, px(8)))
+
+        dlg.grab_set()
 
     def flash(self, text):
         self.error_bar.config(text=text)
@@ -677,6 +801,129 @@ class ChatClient:
             self.entry.delete(0, "end")
             self.drafts[self.active] = ""  # the server echo is the only displayed message
 
+    def choose_file(self):
+        if not self.can_send(self.active):
+            return
+        filepath = filedialog.askopenfilename(
+            title="Select file or picture to send",
+            filetypes=[
+                ("All files", "*.*"),
+                ("Images", "*.png;*.gif;*.jpg;*.jpeg;*.webp;*.bmp"),
+                ("Documents", "*.pdf;*.txt;*.docx"),
+            ]
+        )
+        if not filepath:
+            return
+        try:
+            filesize = os.path.getsize(filepath)
+            with open(filepath, "rb") as f:
+                raw_bytes = f.read()
+        except OSError as exc:
+            self.flash(f"Could not open file: {exc}")
+            return
+        if filesize > 10 * 1024 * 1024:
+            self.flash("File exceeds the 10 MB limit")
+            return
+        if filesize == 0:
+            self.flash("Cannot send an empty file")
+            return
+
+        target_type, target = self.active
+        filename = os.path.basename(filepath)
+        file_id = uuid.uuid4().hex[:16]
+        self.file_data_store[file_id] = raw_bytes
+        self.flash(f"Sending {filename}...")
+
+        def upload():
+            ok = self.core.send_file(target_type, target, filepath, file_id=file_id)
+            if not ok:
+                self.file_data_store.pop(file_id, None)
+                self.inbox.put({"type": "error", "text": f"Failed to send '{filename}'"})
+
+        threading.Thread(target=upload, daemon=True).start()
+
+    def format_bytes(self, n):
+        if n >= 1024 * 1024:
+            return f"{n / (1024 * 1024):.1f} MB"
+        if n >= 1024:
+            return f"{n / 1024:.1f} KB"
+        return f"{n} B"
+
+    def create_image_thumbnail(self, filename, raw_bytes):
+        if HAS_PIL:
+            try:
+                import io
+                pil_im = Image.open(io.BytesIO(raw_bytes))
+                pil_im.thumbnail((360, 260))
+                return ImageTk.PhotoImage(pil_im)
+            except Exception:
+                pass
+        if filename.lower().endswith((".png", ".gif")):
+            try:
+                b64_str = base64.b64encode(raw_bytes).decode("ascii")
+                img = tk.PhotoImage(data=b64_str)
+                w, h = img.width(), img.height()
+                if w > 360 or h > 260:
+                    factor = max(1, (w + 359) // 360, (h + 259) // 260)
+                    img = img.subsample(factor, factor)
+                return img
+            except Exception:
+                pass
+        return None
+
+    def show_file(self, key, sender, filename, filesize, file_id, raw_bytes=None):
+        box = self.open_room(key)
+        tag = "name:" + sender
+        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"))
+        box.configure(state="normal")
+        box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time")
+
+        card = tk.Frame(box, bg="#1B1F27", padx=px(14), pady=px(10),
+                        highlightthickness=px(1), highlightbackground=LINE)
+
+        # Image preview for image files
+        is_image = filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp"))
+        if is_image and raw_bytes:
+            img = self.create_image_thumbnail(filename, raw_bytes)
+            if img:
+                self.file_photos.append(img)
+                img_lbl = tk.Label(card, image=img, bg="#1B1F27")
+                img_lbl.pack(anchor="w", pady=(0, px(8)))
+
+        info_row = tk.Frame(card, bg="#1B1F27")
+        info_row.pack(fill="x")
+        icon = "🖼️ " if is_image else "📄 "
+        label(info_row, icon + filename, 10, bold=True).pack(side="left")
+        label(info_row, f" ({self.format_bytes(filesize)})", 9, MUTED).pack(side="left")
+
+        # Save button for recipient or when data is available
+        data_to_save = raw_bytes or self.file_data_store.get(file_id)
+        if data_to_save is not None:
+            def save():
+                dest = filedialog.asksaveasfilename(initialfile=filename, title=f"Save {filename}")
+                if dest:
+                    try:
+                        with open(dest, "wb") as f:
+                            f.write(data_to_save)
+                        self.flash(f"Saved {filename}")
+                    except OSError as err:
+                        self.flash(f"Save failed: {err}")
+            save_btn = button(card, "💾 Save file", save, bg=RAISED, padx=8, pady=4)
+            save_btn.pack(anchor="w", pady=(px(8), 0))
+
+        box.window_create("end", window=card)
+        box.insert("end", "\n\n")
+        box.configure(state="disabled")
+        box.see("end")
+        if key != self.active:
+            self.unread[key] = self.unread.get(key, 0) + 1
+            self.render_sidebar()
+        box.configure(state="disabled")
+        box.see("end")
+        if key != self.active:
+            self.unread[key] = self.unread.get(key, 0) + 1
+            self.render_sidebar()
+
     # ---------- network events (queued by ChatCore's thread) ----------
     def poll(self):
         if self.closed:
@@ -686,9 +933,30 @@ class ChatClient:
                 self.handle(self.inbox.get())
                 if self.closed:
                     return
+            self.check_timeout_countdown()
         finally:
             if not self.closed:  # an error still reaches Tk's report; later messages keep arriving
                 self.poll_job = self.root.after(100, self.poll)
+
+    def check_timeout_countdown(self):
+        if not self.active or self.active[0] != "group":
+            return
+        g = self.active[1]
+        expiry = self.my_timeouts.get(g)
+        if expiry is None:
+            return
+        remaining = expiry - time.time()
+        if remaining > 0:
+            if self.name in self.groups.get(g, []):
+                rem = max(1, int(remaining))
+                self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+            return
+        self.my_timeouts.pop(g, None)
+        self.group_timeouts.get(g, {}).pop(self.name, None)
+        if self.name in self.groups.get(g, []):
+            self.subtitle.config(text="Only members see these messages")
+        self.refresh_ai_controls()
+        self.render_members()
 
     def handle(self, msg):
         try:
@@ -728,8 +996,67 @@ class ChatClient:
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
         elif kind == "group_msg":
-            if self.can_send(("group", msg["group"])):
+            if self.name in self.groups.get(msg["group"], []):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
+        elif kind == "file_start":
+            file_id = msg["file_id"]
+            sender = msg["from"]
+            target_type = msg["target_type"]
+            target = msg["target"]
+            filesize = int(msg["filesize"])
+            filename = msg["filename"]
+            if sender == self.name:
+                room_key = ("pm", target) if target_type == "pm" else ("group", target)
+                raw_bytes = self.file_data_store.get(file_id)
+                self.show_file(room_key, sender, filename, filesize, file_id, raw_bytes=raw_bytes)
+            else:
+                self.incoming_files[file_id] = {"meta": msg, "chunks": {}}
+        elif kind == "file_chunk":
+            file_id = msg["file_id"]
+            if file_id in self.incoming_files:
+                entry = self.incoming_files[file_id]
+                chunk_idx = int(msg["chunk"])
+                entry["chunks"][chunk_idx] = msg["data"]
+                total = int(entry["meta"]["chunks"])
+                if len(entry["chunks"]) >= total:
+                    try:
+                        raw_bytes = b"".join(base64.b64decode(entry["chunks"][i]) for i in range(total))
+                    except Exception:
+                        raw_bytes = b""
+                    self.file_data_store[file_id] = raw_bytes
+                    meta = entry["meta"]
+                    del self.incoming_files[file_id]
+
+                    sender = meta["from"]
+                    target_type = meta["target_type"]
+                    target = meta["target"]
+                    room_key = ("pm", sender) if target_type == "pm" else ("group", target)
+                    self.show_file(room_key, sender, meta["filename"], len(raw_bytes), file_id, raw_bytes=raw_bytes)
+        elif kind == "timeout_notice":
+            g = msg["group"]
+            target = msg["target"]
+            try:
+                secs = int(msg.get("seconds", 0))
+            except (ValueError, TypeError):
+                secs = 0
+            if secs <= 0:
+                if g in self.group_timeouts:
+                    self.group_timeouts[g].pop(target, None)
+                if target == self.name:
+                    self.my_timeouts.pop(g, None)
+            else:
+                exp = time.time() + secs
+                self.group_timeouts.setdefault(g, {})[target] = exp
+                if target == self.name:
+                    self.my_timeouts[g] = exp
+            if self.active and self.active == ("group", g):
+                self.refresh_ai_controls()
+                if self.name in self.groups.get(g, []) and self.is_my_timeout_active(g):
+                    rem = max(1, int(self.my_timeouts[g] - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+                elif self.name in self.groups.get(g, []):
+                    self.subtitle.config(text="Only members see these messages")
+            self.render_members()
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])

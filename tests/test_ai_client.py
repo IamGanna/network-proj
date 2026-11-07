@@ -95,6 +95,22 @@ class AiClientTests(unittest.TestCase):
         self.app.select(('group','Preview'))
         self.assertFalse(self.app.start_ai('summary'))
 
+    def test_group_timeout_expiry_preserves_pending_draft_lock(self):
+        self.app.select(('group', 'G'))
+        self.app.entry.insert(0, 'my draft')
+        self.assertTrue(self.app.start_ai('draft'))
+        with patch.object(client.time, 'time', return_value=100):
+            self.app.handle(dict(type='timeout_notice', group='G', target='Alice', seconds=10))
+            self.assertEqual(str(self.app.file_button['state']), 'disabled')
+            self.assertIn('timed out', self.app.subtitle['text'])
+        with patch.object(client.time, 'time', return_value=110):
+            self.app.check_timeout_countdown()
+        self.assertEqual(self.app.subtitle['text'], 'Only members see these messages')
+        self.assertEqual(str(self.app.file_button['state']), 'normal')
+        self.assertEqual(str(self.app.entry['state']), 'disabled')
+        self.assertEqual(str(self.app.send_button['state']), 'disabled')
+        self.assertEqual(self.app.entry.get(), 'my draft')
+
     def test_instruction_dialog_captures_room_and_accepts_empty_instruction(self):
         self.app.draft_reply()
         dialog = self.app.instruction_dialog
