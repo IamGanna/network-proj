@@ -111,8 +111,6 @@ def disconnect_sessions(pending):
                 for group in list(groups):
                     if name in groups[group]:
                         groups[group].remove(name)
-                        if group in group_timeouts:
-                            group_timeouts[group].pop(name, None)
                         if not groups[group]:
                             del groups[group]
                             group_creators.pop(group, None)
@@ -162,6 +160,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     new = msg["name"].strip() if kind == "login" else ""
                     if kind != "login" or not new:
                         send(session, {"type": "error", "text": "Please log in with a name"}, failed)
+                    elif new.casefold() == "[system]":  # the server signs its notices with this name
+                        send(session, {"type": "error", "text": "The name '[System]' is reserved"}, failed)
                     elif new in clients:  # R3: unique names
                         send(session, {"type": "error", "text": f"Name '{new}' is already taken"}, failed)
                     elif not state_fits(list(clients) + [new], groups):
@@ -260,7 +260,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     try:
                         filesize = int(filesize_str)
                         chunks = int(chunks_str)
-                        if filesize <= 0 or chunks <= 0 or filesize > 10 * 1024 * 1024:
+                        if filesize <= 0 or chunks <= 0 or chunks > filesize or filesize > 10 * 1024 * 1024:
                             raise ValueError()
                     except (ValueError, TypeError):
                         send(session, {"type": "error", "text": "Invalid file size or chunk count (max 10MB)"}, failed)
@@ -273,6 +273,10 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                             send(session, {"type": "error", "text": f"You are not a member of '{target}'"}, failed)
                         elif target_type == "group" and name in group_timeouts.get(target, {}) and time.time() < group_timeouts[target][name]:
                             send(session, {"type": "error", "text": f"You are timed out in '{target}'"}, failed)
+                        elif file_id in active_transfers:  # reusing a live id would take over someone's upload
+                            send(session, {"type": "error", "text": "That file id is already in use"}, failed)
+                        elif sum(t["from"] == name for t in active_transfers.values()) >= 3:
+                            send(session, {"type": "error", "text": "You can send at most 3 files at once"}, failed)
                         else:
                             out = {
                                 "type": "file_start",
@@ -295,6 +299,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                                     "target": target,
                                     "total_chunks": chunks,
                                     "received_chunks": 0,
+                                    "filesize": filesize,
+                                    "bytes": 0,
                                 }
                                 if target_type == "pm":
                                     for rec in {clients[target], session}:
@@ -309,12 +315,14 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     file_id = msg.get("file_id")
                     chunk = msg.get("chunk")
                     data_chunk = msg.get("data")
-                    if file_id not in active_transfers:
-                        send(session, {"type": "error", "text": "Unknown or expired file transfer"}, failed)
-                    else:
+                    if file_id in active_transfers:  # chunks of a refused or cancelled upload are dropped quietly
                         trans = active_transfers[file_id]
+                        size = len(data_chunk) * 3 // 4  # decoded bytes, at most 2 over because of base64 padding
                         if trans["from"] != name:
                             send(session, {"type": "error", "text": "Unauthorized file chunk"}, failed)
+                        elif trans["bytes"] + size > trans["filesize"] + 2:
+                            del active_transfers[file_id]
+                            send(session, {"type": "error", "text": "File is bigger than its stated size"}, failed)
                         else:
                             out = {
                                 "type": "file_chunk",
@@ -328,6 +336,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                                 send(session, {"type": "error", "text": "Frame limit reached"}, failed)
                             else:
                                 trans["received_chunks"] += 1
+                                trans["bytes"] += size
                                 if trans["target_type"] == "pm":
                                     target = trans["target"]
                                     if target in clients:
@@ -359,7 +368,7 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     else:
                         try:
                             duration = int(duration_val)
-                            if duration < 0:
+                            if not 0 <= duration <= 31_536_000:  # at most a year
                                 raise ValueError()
                         except ValueError:
                             send(session, {"type": "error", "text": "Invalid timeout duration"}, failed)
