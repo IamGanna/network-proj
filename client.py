@@ -12,6 +12,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
+from pathlib import Path
 from tkinter import filedialog, messagebox
 
 try:
@@ -22,6 +23,17 @@ except ImportError:
 
 from chat_core import ChatCore
 from protocol import validate_server_event
+try:
+    import voice
+except ImportError:
+    voice = None
+
+_env = Path(__file__).parent / ".env"
+if _env.exists():
+    for _line in _env.read_text().splitlines():
+        if "=" in _line and not _line.startswith("#"):
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
 
 HOST, PORT = "127.0.0.1", 5000
 
@@ -152,12 +164,16 @@ class ChatClient:
         self.file_photos = []  # retain PhotoImage references
         self.group_timeouts = {}  # group -> {member: expiry_timestamp}
         self.my_timeouts = {}     # group -> expiry_timestamp
+        self.group_timeouts = {}  # group -> {member: expiry_timestamp}
+        self.my_timeouts = {}     # group -> expiry_timestamp
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
         self.active = None
         self.want = None  # group we created/joined: open it once the server confirms membership
         self.flash_job = None
+        self.auto_speak = False
+        self.recording = False
         self.inbox = queue.Queue()  # network thread -> GUI thread (Tkinter is not thread-safe)
         self.build_login()
 
@@ -295,6 +311,10 @@ class ChatClient:
         self.file_button.pack(side="right", padx=(px(8), 0))
         self.send_button = button(composer, "Send", self.send_text, primary=True)
         self.send_button.pack(side="right", padx=(px(8), 0))
+        self.speak_btn = button(composer, "🔊", self._toggle_speak, bg=RAISED, padx=10, pady=8)
+        self.speak_btn.pack(side="right", padx=(px(4), 0))
+        self.mic_btn = button(composer, "🎤", self._toggle_mic, bg=RAISED, padx=10, pady=8)
+        self.mic_btn.pack(side="right", padx=(px(4), 0))
         self.stage = tk.Frame(self.center, bg=PANEL)
         self.stage.pack(fill="both", expand=True)
         self.empty = label(self.stage, "Pick a group or someone online to start chatting.", 11, MUTED)
@@ -585,6 +605,34 @@ class ChatClient:
         button(btns, "Cancel", dlg.destroy).pack(side="right", padx=(0, px(8)))
         dlg.grab_set()
 
+    def _toggle_mic(self):
+        if not self.recording:
+            self.recording = True
+            self.mic_btn.config(bg=ERROR)
+            voice.start_recording()
+        else:
+            self.recording = False
+            self.mic_btn.config(text="⏳", bg=RAISED)
+            voice.stop_recording(self._on_transcribed)
+
+    def _on_transcribed(self, text, error):
+        if self.closed:
+            return
+        def _update():
+            self.mic_btn.config(text="🎤")
+            if error:
+                self.flash(f"STT error: {error}")
+            elif text and self.entry["state"] == "normal":
+                self.entry.insert("end", (" " + text) if self.entry.get() else text)
+        self.root.after(0, _update)
+
+    def _toggle_speak(self):
+        self.auto_speak = not self.auto_speak
+        self.speak_btn.config(bg=ACCENT if self.auto_speak else RAISED,
+                              fg=ON_ACCENT if self.auto_speak else TEXT)
+        if not self.auto_speak and voice:
+            voice.stop()
+
     def send_text(self, _event=None):
         text = self.entry.get().strip()
         if not text or not self.can_send(self.active):
@@ -779,6 +827,8 @@ class ChatClient:
         elif kind == "pm":
             other = msg["to"] if msg["from"] == self.name else msg["from"]
             self.show(("pm", other), msg["from"], msg["text"])
+            if self.auto_speak and msg["from"] != self.name:
+                voice.speak(msg["text"])
         elif kind == "group_msg":
             if self.name in self.groups.get(msg["group"], []):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
@@ -816,6 +866,33 @@ class ChatClient:
                     target = meta["target"]
                     room_key = ("pm", sender) if target_type == "pm" else ("group", target)
                     self.show_file(room_key, sender, meta["filename"], len(raw_bytes), file_id, raw_bytes=raw_bytes)
+        elif kind == "timeout_notice":
+            g = msg["group"]
+            target = msg["target"]
+            try:
+                secs = int(msg.get("seconds", 0))
+            except (ValueError, TypeError):
+                secs = 0
+            if secs <= 0:
+                if g in self.group_timeouts:
+                    self.group_timeouts[g].pop(target, None)
+                if target == self.name:
+                    self.my_timeouts.pop(g, None)
+            else:
+                exp = time.time() + secs
+                self.group_timeouts.setdefault(g, {})[target] = exp
+                if target == self.name:
+                    self.my_timeouts[g] = exp
+            if self.active and self.active == ("group", g):
+                allowed = self.can_send(self.active)
+                self.entry.config(state="normal" if allowed else "disabled")
+                self.send_button.config(state="normal" if allowed else "disabled")
+                if self.is_my_timeout_active(g):
+                    rem = max(1, int(self.my_timeouts[g] - time.time()))
+                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+                elif self.name in self.groups.get(g, []):
+                    self.subtitle.config(text="Only members see these messages")
+            self.render_members()
         elif kind == "timeout_notice":
             g = msg["group"]
             target = msg["target"]
