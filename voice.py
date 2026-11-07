@@ -2,8 +2,10 @@
 import asyncio
 import io
 import os
+import queue
 import tempfile
 import threading
+import time
 import wave
 
 import edge_tts
@@ -21,35 +23,46 @@ _stream = None
 _frames = []
 _frames_lock = threading.Lock()
 
+# shortcut: queue unbounded, backlog grows if TTS is slower than message rate; cap with maxsize if needed
+_tts_queue = queue.Queue()
 
-def speak(text):
-    """Fire-and-forget TTS; returns immediately."""
-    def _run():
+
+def _tts_worker():
+    pygame.mixer.init()
+    while True:
+        text = _tts_queue.get()
+        if text is None:
+            break
         voice = _VOICE_TH if any("฀" <= c <= "๿" for c in text) else _VOICE_EN
 
-        async def _save(path):
-            await edge_tts.Communicate(text, voice=voice).save(path)
+        async def _save(path, v=voice, t=text):
+            await edge_tts.Communicate(t, voice=v).save(path)
 
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as f:
             path = f.name
         try:
             asyncio.run(_save(path))
-            pygame.mixer.init()
             pygame.mixer.music.load(path)
             pygame.mixer.music.play()
-            import time
             while pygame.mixer.music.get_busy():
                 time.sleep(0.05)
         except Exception as e:
             print(f"[voice] TTS error: {e}")
         finally:
             try:
-                pygame.mixer.quit()
                 os.unlink(path)
             except OSError:
                 pass
+        _tts_queue.task_done()
+    pygame.mixer.quit()
 
-    threading.Thread(target=_run, daemon=True).start()
+
+threading.Thread(target=_tts_worker, daemon=True).start()
+
+
+def speak(text):
+    """Fire-and-forget TTS; queues behind any current playback."""
+    _tts_queue.put(text)
 
 
 def start_recording():
