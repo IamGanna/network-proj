@@ -73,6 +73,7 @@ CLIENT_FIELDS = {
     'create_group': ('group',),
     'join_group': ('group',),
     'group_msg': ('group', 'text'),
+    'timeout_member': ('group', 'target', 'duration'),
 }
 SERVER_FIELDS = {
     'login_ok': ('name',),
@@ -82,6 +83,7 @@ SERVER_FIELDS = {
     'group_msg': ('group', 'from', 'text'),
     'error': ('text',),
     'disconnected': (),
+    'timeout_notice': ('group', 'target', 'seconds'),
 }
 
 
@@ -97,6 +99,12 @@ def _validate_fields(msg, schemas):
         raise ValueError('Unknown or missing message type')
     for field in schemas[kind]:
         value = msg.get(field)
+        if field in ('duration', 'seconds'):
+            if isinstance(value, int) and value >= 0:
+                continue
+            if isinstance(value, str) and value.isdigit():
+                continue
+            raise ValueError(f"Field '{field}' must be a non-negative integer or digit string")
         if isinstance(value, str) and field != 'text' and len(value) > MAX_NAME_CHARS:
             raise ValueError(f"Field '{field}' exceeds the {MAX_NAME_CHARS}-character name limit")
         if not isinstance(value, str) or (field != 'text' and not _name(value)):
