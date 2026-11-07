@@ -1,8 +1,11 @@
 """Tests for group chat timeout (Discord-style timeout in gc)."""
 import time
+import tkinter as tk
 import unittest
+from unittest.mock import MagicMock, patch
 
 from chat_core import ChatCore
+import client
 import server
 from tests.support import Events, LoopbackServer
 
@@ -134,6 +137,89 @@ class GroupTimeoutTests(unittest.TestCase):
         expected_msg = {"type": "group_msg", "group": "study", "from": "Bob", "text": "expired timeout"}
         self.assertEqual(ae.wait(lambda m: m == expected_msg), expected_msg)
         self.assertEqual(be.wait(lambda m: m == expected_msg), expected_msg)
+
+    def test_ui_timeout_badge_auto_expires_in_members_panel(self):
+        root = tk.Tk()
+        try:
+            with patch.object(client, "ChatCore", return_value=MagicMock()):
+                app = client.ChatClient(root)
+            app.name = "Alice"
+            app.login_frame.destroy()
+            app.build_ui()
+            app.handle({"type": "groups", "groups": {"study": ["Alice", "Bob"]}})
+            app.select(("group", "study"))
+
+            # Initially no timeout badge
+            def get_member_badges():
+                labels = [w.cget("text") for r in app.member_list.content.winfo_children()
+                          for w in r.winfo_children() if isinstance(w, tk.Label)]
+                buttons = [w.cget("text") for r in app.member_list.content.winfo_children()
+                           for w in r.winfo_children() if isinstance(w, tk.Button)]
+                return labels, buttons
+
+            labels, btns = get_member_badges()
+            self.assertNotIn(" Timed out ", labels)
+            self.assertIn("Timeout", btns)
+
+            # Apply 1 second timeout to Bob
+            app.handle({"type": "timeout_notice", "group": "study", "target": "Bob", "seconds": 1})
+            labels, btns = get_member_badges()
+            self.assertIn(" Timed out ", labels)
+            self.assertIn("Manage", btns)
+
+            # Before expiry, badge is still present
+            app.check_timeout_countdown()
+            labels, btns = get_member_badges()
+            self.assertIn(" Timed out ", labels)
+
+            # Wait for expiry
+            time.sleep(1.05)
+            app.check_timeout_countdown()
+
+            # Now Timed out tag must disappear automatically and Manage returns to Timeout
+            labels, btns = get_member_badges()
+            self.assertNotIn(" Timed out ", labels)
+            self.assertIn("Timeout", btns)
+            self.assertNotIn("Manage", btns)
+        finally:
+            app.close()
+
+    def test_ui_own_timeout_badge_and_input_auto_restores(self):
+        root = tk.Tk()
+        try:
+            with patch.object(client, "ChatCore", return_value=MagicMock()):
+                app = client.ChatClient(root)
+            app.name = "Bob"
+            app.login_frame.destroy()
+            app.build_ui()
+            app.handle({"type": "groups", "groups": {"study": ["Alice", "Bob"]}})
+            app.select(("group", "study"))
+
+            # Bob receives timeout_notice
+            app.handle({"type": "timeout_notice", "group": "study", "target": "Bob", "seconds": 1})
+            self.assertEqual(str(app.entry.cget("state")), "disabled")
+            self.assertEqual(str(app.send_button.cget("state")), "disabled")
+            self.assertEqual(str(app.file_button.cget("state")), "disabled")
+            self.assertIn("⏳ You are timed out", app.subtitle.cget("text"))
+
+            labels = [w.cget("text") for r in app.member_list.content.winfo_children()
+                      for w in r.winfo_children() if isinstance(w, tk.Label)]
+            self.assertIn(" Timed out ", labels)
+
+            # Wait for expiry
+            time.sleep(1.05)
+            app.check_timeout_countdown()
+
+            # Now Timed out badge disappears and input controls re-enable
+            labels = [w.cget("text") for r in app.member_list.content.winfo_children()
+                      for w in r.winfo_children() if isinstance(w, tk.Label)]
+            self.assertNotIn(" Timed out ", labels)
+            self.assertEqual(str(app.entry.cget("state")), "normal")
+            self.assertEqual(str(app.send_button.cget("state")), "normal")
+            self.assertEqual(str(app.file_button.cget("state")), "normal")
+            self.assertEqual(app.subtitle.cget("text"), "Only members see these messages")
+        finally:
+            app.close()
 
 
 if __name__ == "__main__":

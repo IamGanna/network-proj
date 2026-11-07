@@ -337,9 +337,15 @@ class ChatClient:
     def is_my_timeout_active(self, group):
         exp = self.my_timeouts.get(group)
         if exp is None:
+            exp = self.group_timeouts.get(group, {}).get(self.name)
+            if exp is not None:
+                self.my_timeouts[group] = exp
+        if exp is None:
             return False
         if time.time() >= exp:
             self.my_timeouts.pop(group, None)
+            if group in self.group_timeouts:
+                self.group_timeouts[group].pop(self.name, None)
             return False
         return True
 
@@ -461,6 +467,11 @@ class ChatClient:
         is_owner = (self.name == owner)
         timeouts = self.group_timeouts.get(g, {})
         now = time.time()
+        for m in list(timeouts):
+            if now >= timeouts[m]:
+                del timeouts[m]
+                if m == self.name:
+                    self.my_timeouts.pop(g, None)
 
         label(self.members_panel, f"MEMBERS · {len(members)}", 9, MUTED, bold=True).pack(anchor="w", pady=(0, px(8)))
         self.member_list = ScrollList(self.members_panel)
@@ -502,6 +513,11 @@ class ChatClient:
 
         timeouts = self.group_timeouts.get(g, {})
         now = time.time()
+        for m in list(timeouts):
+            if now >= timeouts[m]:
+                del timeouts[m]
+                if m == self.name:
+                    self.my_timeouts.pop(g, None)
         is_currently_timed_out = target in timeouts and now < timeouts[target]
         if is_currently_timed_out:
             rem = max(1, int(timeouts[target] - now))
@@ -733,20 +749,40 @@ class ChatClient:
         self.poll_job = self.root.after(100, self.poll)
 
     def check_timeout_countdown(self):
-        if self.active and self.active[0] == "group":
-            g = self.active[1]
-            if self.is_my_timeout_active(g):
-                rem = int(self.my_timeouts[g] - time.time())
-                if rem > 0:
-                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
-                    self.entry.config(state="disabled")
-                    self.send_button.config(state="disabled")
-                else:
-                    self.my_timeouts.pop(g, None)
-                    self.entry.config(state="normal")
-                    self.send_button.config(state="normal")
-                    self.subtitle.config(text="Only members see these messages")
-                    self.render_members()
+        now = time.time()
+        active_group_had_expiry = False
+        active_g = self.active[1] if (self.active and self.active[0] == "group") else None
+
+        for grp, grp_timeouts in list(self.group_timeouts.items()):
+            for m, exp in list(grp_timeouts.items()):
+                if now >= exp:
+                    grp_timeouts.pop(m, None)
+                    if m == self.name and grp in self.my_timeouts:
+                        self.my_timeouts.pop(grp, None)
+                    if grp == active_g:
+                        active_group_had_expiry = True
+
+        if active_g and active_g in self.my_timeouts and now >= self.my_timeouts[active_g]:
+            self.my_timeouts.pop(active_g, None)
+            active_group_had_expiry = True
+
+        if active_group_had_expiry:
+            self.render_members()
+            allowed = self.can_send(self.active)
+            self.entry.config(state="normal" if allowed else "disabled")
+            self.send_button.config(state="normal" if allowed else "disabled")
+            self.file_button.config(state="normal" if allowed else "disabled")
+            if self.name in self.groups.get(active_g, []):
+                self.subtitle.config(text="Only members see these messages")
+            if allowed:
+                self.entry.focus_set()
+
+        if active_g and self.is_my_timeout_active(active_g):
+            rem = max(1, int(self.my_timeouts[active_g] - now))
+            self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
+            self.entry.config(state="disabled")
+            self.send_button.config(state="disabled")
+            self.file_button.config(state="disabled")
 
     def handle(self, msg):
         try:
@@ -837,6 +873,7 @@ class ChatClient:
                 allowed = self.can_send(self.active)
                 self.entry.config(state="normal" if allowed else "disabled")
                 self.send_button.config(state="normal" if allowed else "disabled")
+                self.file_button.config(state="normal" if allowed else "disabled")
                 if self.is_my_timeout_active(g):
                     rem = max(1, int(self.my_timeouts[g] - time.time()))
                     self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
