@@ -16,6 +16,8 @@ HOST, PORT = "0.0.0.0", 5000  # 0.0.0.0 = accept connections from other computer
 clients = {}  # name -> Session
 groups = {}   # group name -> list of member names
 active_transfers = {}  # file_id -> transfer metadata
+group_creators = {}  # group name -> creator name
+group_timeouts = {}  # group name -> {target_member_name: expiry_timestamp}
 lock = threading.Lock()  # guards state, recipient selection and outbound enqueue order
 
 
@@ -109,10 +111,19 @@ def disconnect_sessions(pending):
                 for group in list(groups):
                     if name in groups[group]:
                         groups[group].remove(name)
+                        if group in group_timeouts:
+                            group_timeouts[group].pop(name, None)
                         if not groups[group]:
                             del groups[group]
+                            group_creators.pop(group, None)
+                            group_timeouts.pop(group, None)
+                        elif group_creators.get(group) == name:
+                            group_creators[group] = groups[group][0]
                 if not clients:
                     active_transfers.clear()
+                if not groups:
+                    group_creators.clear()
+                    group_timeouts.clear()
                 broadcast_state(pending)
         try:
             session.conn.shutdown(socket.SHUT_RDWR)
@@ -184,6 +195,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                         send(session, {"type": "error", "text": "State limit reached"}, failed)
                     else:
                         groups[g] = [name]
+                        group_creators[g] = name
+                        group_timeouts[g] = {}
                         broadcast_state(failed)
 
                 elif kind == "join_group":  # R10: a client only ever adds itself
@@ -197,21 +210,45 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                         else:
                             groups[g].append(name)
                             broadcast_state(failed)
+                            if g in group_timeouts and name in group_timeouts[g]:
+                                exp = group_timeouts[g][name]
+                                if time.time() < exp:
+                                    send(session, {
+                                        "type": "timeout_notice",
+                                        "group": g,
+                                        "target": name,
+                                        "seconds": int(exp - time.time()) + 1,
+                                    }, failed)
 
                 elif kind == "group_msg":  # R11: only members get it, only members may send
                     g = msg.get("group")
                     if name not in groups.get(g, []):
                         send(session, {"type": "error", "text": f"You are not a member of '{g}'"}, failed)
                     else:
-                        out = {"type": "group_msg", "group": g, "from": name, "text": msg["text"]}
-                        try:
-                            output = encode(out)
-                        except ValueError:
-                            send(session, {"type": "error", "text": "Frame limit reached"}, failed)
+                        timeouts = group_timeouts.get(g, {})
+                        now = time.time()
+                        if name in timeouts and now < timeouts[name]:
+                            remaining = int(timeouts[name] - now) + 1
+                            if remaining >= 3600:
+                                rem_str = f"{remaining // 3600}h {(remaining % 3600) // 60}m"
+                            elif remaining >= 60:
+                                rem_str = f"{remaining // 60}m {remaining % 60}s"
+                            else:
+                                rem_str = f"{remaining}s"
+                            send(session, {"type": "error", "text": f"You are timed out in '{g}' ({rem_str} remaining)"}, failed)
                         else:
-                            for member in groups[g]:
-                                if not clients[member].enqueue(output):
-                                    failed.add(clients[member])
+                            if name in timeouts and now >= timeouts[name]:
+                                del timeouts[name]
+                            out = {"type": "group_msg", "group": g, "from": name, "text": msg["text"]}
+                            try:
+                                output = encode(out)
+                            except ValueError:
+                                send(session, {"type": "error", "text": "Frame limit reached"}, failed)
+                            else:
+                                for member in groups[g]:
+                                    if not clients[member].enqueue(output):
+                                        failed.add(clients[member])
+
                 elif kind == "file_start":
                     target_type = msg.get("target_type")
                     target = msg.get("target")
@@ -302,6 +339,71 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                                                 failed.add(clients[member])
                                 if trans["received_chunks"] >= trans["total_chunks"]:
                                     del active_transfers[file_id]
+
+                elif kind == "timeout_member":
+                    g = msg.get("group")
+                    target = msg.get("target")
+                    duration_val = msg.get("duration", "60")
+                    if g not in groups:
+                        send(session, {"type": "error", "text": f"Group '{g}' does not exist"}, failed)
+                    elif name not in groups.get(g, []):
+                        send(session, {"type": "error", "text": f"You are not a member of '{g}'"}, failed)
+                    elif group_creators.get(g) != name:
+                        send(session, {"type": "error", "text": f"Only the group admin can timeout members"}, failed)
+                    elif target not in groups.get(g, []):
+                        send(session, {"type": "error", "text": f"'{target}' is not a member of '{g}'"}, failed)
+                    elif target == name:
+                        send(session, {"type": "error", "text": "You cannot timeout yourself"}, failed)
+                    else:
+                        try:
+                            duration = int(duration_val)
+                            if duration < 0:
+                                raise ValueError()
+                        except ValueError:
+                            send(session, {"type": "error", "text": "Invalid timeout duration"}, failed)
+                        else:
+                            timeouts = group_timeouts.setdefault(g, {})
+                            now = time.time()
+                            if duration == 0:
+                                timeouts.pop(target, None)
+                                notice_text = f"[System] {target}'s timeout was removed by {name}."
+                            else:
+                                timeouts[target] = now + duration
+                                if duration >= 604800:
+                                    dur_desc = f"{duration // 604800} week(s)"
+                                elif duration >= 86400:
+                                    dur_desc = f"{duration // 86400} day(s)"
+                                elif duration >= 3600:
+                                    dur_desc = f"{duration // 3600} hour(s)"
+                                elif duration >= 60:
+                                    dur_desc = f"{duration // 60} minute(s)"
+                                else:
+                                    dur_desc = f"{duration} second(s)"
+                                notice_text = f"[System] {target} was timed out by {name} for {dur_desc}."
+
+                            notice_event = {
+                                "type": "timeout_notice",
+                                "group": g,
+                                "target": target,
+                                "seconds": duration,
+                            }
+                            sys_msg = {
+                                "type": "group_msg",
+                                "group": g,
+                                "from": "[System]",
+                                "text": notice_text,
+                            }
+                            try:
+                                ev_encoded = encode(notice_event)
+                                msg_encoded = encode(sys_msg)
+                            except ValueError:
+                                send(session, {"type": "error", "text": "Frame limit reached"}, failed)
+                            else:
+                                for member in groups[g]:
+                                    target_sess = clients.get(member)
+                                    if target_sess:
+                                        if not target_sess.enqueue(ev_encoded) or not target_sess.enqueue(msg_encoded):
+                                            failed.add(target_sess)
                 else:
                     send(session, {"type": "error", "text": "Already logged in"}, failed)
             disconnect_sessions(failed)

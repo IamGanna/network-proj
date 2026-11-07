@@ -235,3 +235,6 @@ class ChatCore:
                 if progress_callback:
                     progress_callback(index + 1, total_chunks)
         return True
+
+    def timeout_member(self, group, target, duration):
+        return self.send({"type": "timeout_member", "group": group, "target": target, "duration": str(duration)})
