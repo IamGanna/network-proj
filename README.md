@@ -220,8 +220,5 @@ truncated to fit. A full outbound queue disconnects the slow session; other
 sessions continue using their own FIFO writers. No uncontrolled load or
 machine-independent throughput claim is implied by these limits.
 
-## todo 
-    - deploy on cloud 
-    - physical-computer demonstration
 
 
