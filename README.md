@@ -25,7 +25,16 @@ Type these in any private or group chat. The server picks every result, so every
 ## Requirements
 
 - Python 3.10 or newer, with Tkinter (included in the standard Windows and macOS installers)
-- No other packages to install
+- The client installs `requirements.txt` by itself on its first run, then starts. If that fails (no internet, no pip), run `pip install -r requirements.txt` yourself. The server needs no extra packages.
+
+## Keys (server only)
+
+Copy `.env.example` to `.env` beside `server.py` and fill in the keys. Clients need no keys.
+
+- `TYPHOON_API_KEY` turns on speech-to-text. The client records with 🎤 and sends the audio to the server over the chat socket; the server asks Typhoon and sends the text back to that client only. It lands in the message box, not sent until you press Send. Recordings are capped at about 60 seconds.
+- `OPENROUTER_API_KEY` turns on AI Summarize and Draft reply.
+
+Without a key the server still runs; that feature just answers with an error.
 
 ## Quick start
 
@@ -69,6 +78,8 @@ they do not establish operation on different physical computers.
 |---|---|
 | `server.py` | TCP server. Tracks online users and groups, and routes messages with a reader and FIFO writer per client. |
 | `activity.py` | Server side of the chat activities (`/coin`, `/dice`, `/rng`, `/poll`, `/vote`). |
+| `stt_service.py` | Server side of speech-to-text: sends a recording to Typhoon with the server's key. |
+| `voice.py` | Client microphone recording and text-to-speech. |
 | `chat_core.py` | Client networking with no UI: login, sending, and a background reader. Any front end can reuse it. |
 | `client.py` | Tkinter desktop UI built on `chat_core.py`. |
 | `protocol.py` | Shared schemas, limits, serialized frames and bounded byte reader. |
@@ -84,6 +95,7 @@ Clients and the server exchange newline-delimited JSON over a single TCP connect
 | `create_group` | `group` |
 | `join_group` | `group` |
 | `group_msg` | `group`, `text` |
+| `stt_chunk` | `stt_id`, `chunk`, `chunks`, `data` (one base64 piece of a WAV recording) |
 
 | Server → client | Fields |
 |---|---|
@@ -93,6 +105,7 @@ Clients and the server exchange newline-delimited JSON over a single TCP connect
 | `pm` | `from`, `to`, `text` |
 | `group_msg` | `group`, `from`, `text` |
 | `error` | `text` |
+| `stt_text` / `stt_error` | `stt_id`, `text` (only to the speaker) |
 
 ## Resource policy
 

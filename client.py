@@ -11,23 +11,21 @@ import threading
 import time
 import uuid
 import tkinter as tk
-from pathlib import Path
 from tkinter import filedialog, messagebox
 
 from chat_core import ChatCore
-from protocol import validate_server_event, AI_MAX_INSTRUCTION
+from protocol import validate_server_event, AI_MAX_INSTRUCTION, MAX_SPEECH_BYTES
 try:
     import voice
     from PIL import Image, ImageTk
-except ImportError as e:
-    raise SystemExit(f"Missing package '{e.name}'. Run: pip install -r requirements.txt")
-
-_env = Path(__file__).parent / ".env"
-if _env.exists():
-    for _line in _env.read_text().splitlines():
-        if "=" in _line and not _line.startswith("#"):
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+except ImportError as e:  # first run on this PC: install the client packages, then start again
+    import subprocess
+    import sys
+    print(f"Missing package '{e.name}'. Installing requirements.txt (first run only)...")
+    requirements = os.path.join(os.path.dirname(os.path.abspath(__file__)), "requirements.txt")
+    if subprocess.call([sys.executable, "-m", "pip", "install", "-r", requirements]) != 0:
+        raise SystemExit("Could not install the packages. Run: pip install -r requirements.txt")
+    raise SystemExit(subprocess.call([sys.executable] + sys.argv))
 
 HOST, PORT = "127.0.0.1", 5000
 
@@ -168,6 +166,7 @@ class ChatClient:
         self.flash_job = None
         self.auto_speak = False
         self.recording = False
+        self.stt_id = None  # the recording the server is transcribing for us
         self.sidebar_pending = False
         self.pending_ai = None
         self.ai_dialogs = set()
@@ -823,23 +822,24 @@ class ChatClient:
     def _toggle_mic(self):
         if not self.recording:
             self.recording = True
-            self.mic_btn.config(bg=ERROR)
+            self.mic_btn.config(text="🎤", bg=ERROR)
             voice.start_recording()
-        else:
-            self.recording = False
-            self.mic_btn.config(text="⏳", bg=RAISED)
-            voice.stop_recording(self._on_transcribed)
-
-    def _on_transcribed(self, text, error):
-        if self.closed:
             return
-        def _update():
-            self.mic_btn.config(text="🎤")
-            if error:
-                self.flash(f"STT error: {error}")
-            elif text and self.entry["state"] == "normal":
-                self.entry.insert("end", (" " + text) if self.entry.get() else text)
-        self.root.after(0, _update)
+        self.recording = False
+        self.mic_btn.config(bg=RAISED)
+        wav = voice.stop_recording()
+        if not wav:
+            return
+        if len(wav) > MAX_SPEECH_BYTES:
+            self.flash("Recording is longer than 60 seconds. Try a shorter one.")
+            return
+        stt_id = self.stt_id = uuid.uuid4().hex
+        self.mic_btn.config(text="⏳")
+
+        def upload():  # the server transcribes it and answers with stt_text or stt_error
+            if not self.core.send_speech(stt_id, wav):
+                self.inbox.put({"type": "stt_error", "stt_id": stt_id, "text": "Could not send the recording"})
+        threading.Thread(target=upload, daemon=True).start()
 
     def _toggle_speak(self):
         self.auto_speak = not self.auto_speak
@@ -1133,6 +1133,15 @@ class ChatClient:
                 elif self.name in self.groups.get(g, []):
                     self.subtitle.config(text="Only members see these messages")
             self.render_members()
+        elif kind in ("stt_text", "stt_error"):
+            if msg["stt_id"] != self.stt_id:
+                return  # an older recording
+            self.stt_id = None
+            self.mic_btn.config(text="🎤")
+            if kind == "stt_error":
+                self.flash(f"STT error: {msg['text']}")
+            elif msg["text"] and self.entry["state"] == "normal":
+                self.entry.insert("end", (" " + msg["text"]) if self.entry.get() else msg["text"])
         elif kind == "error":
             self.want = None
             self.flash(msg["text"])

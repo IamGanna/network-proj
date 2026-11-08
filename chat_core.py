@@ -6,12 +6,15 @@ Any front end (Tkinter, CLI, web bridge) can use it:
     core.start(on_message)   # on_message(dict) runs on a background thread
     core.group_msg("study-room", "hi")
 """
+import base64
 import json
 import socket
 import threading
 import time
 
 from protocol import FrameReader, enable_keepalive, encode_frame, validate_client_message, validate_server_event
+
+CHUNK_BYTES = 32766  # multiple of 3 so base64 chunks have no padding; one chunk fits a 64 KB frame
 
 
 class ChatCore:
@@ -217,7 +220,7 @@ class ChatCore:
         if file_id is None:
             file_id = uuid.uuid4().hex[:16]
 
-        chunk_size = 32766  # Multiple of 3 (3 * 10922) so base64 chunks contain no padding
+        chunk_size = CHUNK_BYTES
         total_chunks = max(1, (filesize + chunk_size - 1) // chunk_size) if filesize > 0 else 1
 
         start_msg = {
@@ -247,6 +250,16 @@ class ChatCore:
                 if progress_callback:
                     progress_callback(index + 1, total_chunks)
         return True
+
+    def send_speech(self, stt_id, wav):
+        """Send a WAV recording in chunks; the server answers with stt_text or stt_error. Blocks the caller."""
+        pieces = [wav[i:i + CHUNK_BYTES] for i in range(0, len(wav), CHUNK_BYTES)]
+        for index, raw in enumerate(pieces):
+            msg = {"type": "stt_chunk", "stt_id": stt_id, "chunk": str(index), "chunks": str(len(pieces)),
+                   "data": base64.b64encode(raw).decode("ascii")}
+            if not self.send(msg, wait=None):
+                return False
+        return bool(pieces)
 
     def timeout_member(self, group, target, duration):
         return self.send({"type": "timeout_member", "group": group, "target": target, "duration": str(duration)})

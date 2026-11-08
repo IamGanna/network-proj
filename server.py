@@ -2,6 +2,7 @@
 
 Run: python server.py
 """
+import base64
 import json
 from collections import deque
 import logging
@@ -13,10 +14,12 @@ import threading
 import time
 
 import activity
+import stt_service
 from protocol import (FrameReader, enable_keepalive, encode_frame, validate_client_message,
-                      validate_server_event, MAX_SESSIONS, MAX_GROUPS, OUTBOUND_QUEUE_FRAMES, LOGIN_TIMEOUT)
+                      validate_server_event, MAX_SESSIONS, MAX_GROUPS, OUTBOUND_QUEUE_FRAMES, LOGIN_TIMEOUT,
+                      MAX_SPEECH_BYTES, MAX_TEXT_CHARS)
 from ai_history import SessionHistory, HistoryError
-from ai_service import AiFailure, AiService, AI_TIMEOUT, PUBLIC_ERRORS, load_server_config
+from ai_service import AiFailure, AiService, AI_TIMEOUT, PUBLIC_ERRORS, load_server_config, read_env_value
 from ai_runtime import AiRuntime
 
 HOST, PORT = "0.0.0.0", 5000  # 0.0.0.0 = accept connections from other computers on the LAN
@@ -26,6 +29,7 @@ groups = {}   # group name -> list of member names
 active_transfers = {}  # file_id -> transfer metadata
 group_creators = {}  # group name -> creator name
 group_timeouts = {}  # group name -> {target_member_name: expiry_timestamp}
+stt_key = ""  # TYPHOON_API_KEY from the server .env, set in main(); empty turns speech-to-text off
 lock = threading.Lock()  # guards state, recipient selection and outbound enqueue order
 
 
@@ -42,6 +46,8 @@ class Session:
         self.pending_ai = None
         self.recent_ai_ids = deque(maxlen=64)
         self.next_ai_at = 0
+        self.stt = None  # the recording being received: {"id", "total", "next", "audio"}
+        self.stt_busy = False  # one transcription at a time per client
         self.closed = threading.Event()
         self._close_lock = threading.Lock()
         self.outbound = queue.Queue(maxsize=OUTBOUND_QUEUE_FRAMES)
@@ -180,6 +186,59 @@ def submit_ai_locked(session, request, ai_runtime, failed):
         return
     session.recent_ai_ids.append(rid)
     session.next_ai_at = now + 5
+
+
+def receive_stt_locked(session, msg, failed):
+    """Collect one recording's chunks in order; after the last one, transcribe off the lock."""
+    sid, index, total = msg["stt_id"], int(msg["chunk"]), int(msg["chunks"])
+
+    def refuse(text):
+        session.stt = None
+        send(session, {"type": "stt_error", "stt_id": sid, "text": text}, failed)
+
+    if index == 0:
+        if not stt_key:
+            return refuse("Speech-to-text is not set up on the server")
+        if session.stt_busy:
+            return refuse("Still transcribing your last recording")
+        if total < 1:
+            return refuse("Bad audio data")
+        session.stt = {"id": sid, "total": total, "next": 0, "audio": bytearray()}
+    pending = session.stt
+    if pending is None or pending["id"] != sid:
+        return  # the rest of a refused recording is dropped quietly
+    try:
+        data = base64.b64decode(msg["data"], validate=True)
+    except ValueError:
+        return refuse("Bad audio data")
+    if index != pending["next"] or total != pending["total"]:
+        return refuse("Bad audio data")
+    if len(pending["audio"]) + len(data) > MAX_SPEECH_BYTES:
+        return refuse("Recording is longer than 60 seconds")
+    pending["audio"] += data
+    pending["next"] += 1
+    if pending["next"] < total:
+        return
+    audio = bytes(pending["audio"])
+    session.stt = None
+    if audio[:4] != b"RIFF" or audio[8:12] != b"WAVE":
+        return refuse("Audio must be a WAV recording")
+    session.stt_busy = True
+    threading.Thread(target=transcribe_job, args=(session, sid, audio, stt_key), daemon=True).start()
+
+
+def transcribe_job(session, sid, audio, key):
+    """Worker thread: the HTTP call to Typhoon never runs under the lock."""
+    try:
+        event = {"type": "stt_text", "stt_id": sid, "text": stt_service.transcribe(audio, key)[:MAX_TEXT_CHARS]}
+    except Exception as exc:
+        text = str(exc) if isinstance(exc, stt_service.SttError) else "Speech-to-text failed"
+        event = {"type": "stt_error", "stt_id": sid, "text": text}
+    failed = set()
+    with lock:
+        session.stt_busy = False
+        send(session, event, failed)
+    disconnect_sessions(failed)
 
 
 def state_fits(names, memberships):
@@ -370,6 +429,9 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
 
                 elif kind == 'ai_request':
                     submit_ai_locked(session, msg, ai_runtime, failed)
+
+                elif kind == "stt_chunk":  # speech-to-text: the server calls Typhoon with its own key
+                    receive_stt_locked(session, msg, failed)
 
                 elif kind == "file_start":
                     target_type = msg.get("target_type")
@@ -633,6 +695,12 @@ def main():
     except AiFailure:
         logging.warning('AI configuration could not be loaded; normal chat remains available.')
     print('AI enabled' if runtime is not None else 'AI disabled: configure OPENROUTER_API_KEY in server .env')
+    global stt_key
+    try:
+        stt_key = read_env_value('TYPHOON_API_KEY')
+    except AiFailure:
+        logging.warning('.env could not be read; speech-to-text is off.')
+    print('Speech-to-text enabled' if stt_key else 'Speech-to-text disabled: configure TYPHOON_API_KEY in server .env')
     try:
         serve(srv, ai_runtime=runtime)
     except KeyboardInterrupt:
