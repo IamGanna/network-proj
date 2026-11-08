@@ -282,7 +282,8 @@ class ChatClient:
         icon_bar = tk.Frame(main, bg=BG, width=px(48))
         icon_bar.pack(side="left", fill="y")
         icon_bar.pack_propagate(False)
-        tk.Label(icon_bar, text="🔥", bg=BG, font=(FONT, 18)).pack(pady=px(14))
+        tk.Label(icon_bar, text="🔥", bg=ACCENT, font=(FONT, 15),
+                 padx=px(6), pady=px(5), cursor="hand2").pack(pady=px(14))
 
         # Column 2 — sidebar (220px)
         side = tk.Frame(main, bg=PANEL, width=px(220))
@@ -294,7 +295,7 @@ class ChatClient:
         hdr = tk.Frame(side, bg=PANEL, padx=px(12), pady=px(14))
         hdr.pack(fill="x")
         label(hdr, "Campfire", 13, bold=True).pack(anchor="w")
-        self.workspace_sub = label(hdr, "Network Project · 0 online", 9, MUTED)
+        self.workspace_sub = label(hdr, "Network Project · 0 online", 9, ONLINE)
         self.workspace_sub.pack(anchor="w")
 
         # Sidebar lists
@@ -323,6 +324,7 @@ class ChatClient:
         me.pack(side="bottom", fill="x")
         tk.Frame(side, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
         avatar(me, self.name, 28).pack(side="left")
+        tk.Label(me, text="⚙", bg=RAISED, fg=MUTED, font=(FONT, 14), cursor="hand2").pack(side="right")
         info = tk.Frame(me, bg=RAISED)
         info.pack(side="left", padx=px(8))
         label(info, self.name, 10, bold=True).pack(anchor="w")
@@ -347,6 +349,10 @@ class ChatClient:
         self.hash_label.pack(side="left")
         self.title = label(name_row, f"Welcome, {self.name}", 15, bold=True)
         self.title.pack(side="left")
+        for _icon in ("ℹ", "👥", "🔍"):
+            tk.Button(name_row, text=_icon, bg=PANEL, fg=MUTED, relief="flat", bd=0,
+                      font=(FONT, 12), padx=px(4), pady=0, cursor="hand2",
+                      activebackground=RAISED, activeforeground=TEXT).pack(side="right", padx=px(2))
         tk.Frame(self.center, bg=LINE, height=px(1)).pack(fill="x")
 
         # Persistent error/offline bars
@@ -359,9 +365,17 @@ class ChatClient:
         composer = tk.Frame(self.center, bg=PANEL, padx=px(16), pady=px(12))
         composer.pack(side="bottom", fill="x")
         tk.Frame(self.center, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
+        self.group_hint = tk.Label(self.center, bg=PANEL, fg=DIM, font=(FONT, 10),
+                                    padx=px(24), pady=px(4), anchor="w",
+                                    text="Only group members can view this channel.")
         self.entry = entry(composer)
         self.entry.pack(side="left", fill="x", expand=True, ipady=px(8))
         self.entry.bind("<Return>", self.send_text)
+        self._entry_has_placeholder = False
+        self._entry_placeholder_text = ""
+        self.entry.bind("<FocusIn>", self._entry_focus_in, add="+")
+        self.entry.bind("<FocusOut>", self._entry_focus_out, add="+")
+
         self.send_button = button(composer, "Send ➤", self.send_text, primary=True)
         self.send_button.pack(side="right", padx=(px(8), 0))
         self.ai_btn = button(composer, "✨ AI", self._toggle_ai_menu, bg=RAISED, padx=10, pady=8)
@@ -416,6 +430,14 @@ class ChatClient:
             box.tag_config("body", foreground="#DCDAD5", spacing1=px(2))
             box.tag_config("grouped", foreground="#DCDAD5",
                            lmargin1=px(48), lmargin2=px(48))
+            box.tag_config("datesep", justify="center", foreground=DIM, font=(FONT, 9),
+                           spacing1=px(8), spacing3=px(4))
+            import time as _t
+            _d = _t.localtime()
+            _date = _t.strftime(f"%B {_d.tm_mday}, %Y")
+            box.configure(state="normal")
+            box.insert("end", f"────────  {_date}  ────────\n", "datesep")
+            box.configure(state="disabled")
             box.place(relwidth=1, relheight=1)
             self.rooms[key] = box
             visible = (self.preview if self.active and self.active[0] == "group"
@@ -497,20 +519,56 @@ class ChatClient:
             return True
         return False
 
+    def _entry_focus_in(self, _event=None):
+        if getattr(self, '_entry_has_placeholder', False):
+            self.entry.delete(0, "end")
+            self.entry.config(fg=TEXT)
+            self._entry_has_placeholder = False
+
+    def _entry_focus_out(self, _event=None):
+        if not getattr(self, '_entry_has_placeholder', False) and not self.entry.get():
+            pt = getattr(self, '_entry_placeholder_text', '')
+            if pt and self.entry["state"] == "normal":
+                self.entry.insert(0, pt)
+                self.entry.config(fg=DIM)
+                self._entry_has_placeholder = True
+
     def select(self, key):
         if key and key[0] == "group" and key[1] not in self.groups:
             key = None
         if self.active is not None:
-            self.drafts[self.active] = self.entry.get()
+            self.drafts[self.active] = ("" if getattr(self, '_entry_has_placeholder', False)
+                                        else self.entry.get())
+        # Clear placeholder state before modifying entry
+        if getattr(self, '_entry_has_placeholder', False):
+            self._entry_has_placeholder = False
+            self.entry.config(fg=TEXT)
         self.active = key
         allowed = self.can_send(key)
 
         self.entry.config(state="normal")
         self.entry.delete(0, "end")
-        if key is not None:
-            self.entry.insert(0, self.drafts.get(key, ""))
+        draft = self.drafts.get(key, "") if key else ""
+        if draft:
+            self.entry.insert(0, draft)
         self.entry.config(state="normal" if allowed else "disabled")
         self.send_button.config(state="normal" if allowed else "disabled")
+
+        # Placeholder
+        self._entry_placeholder_text = ""
+        if allowed and not draft and key:
+            self._entry_placeholder_text = (f"Message #{key[1]}" if key[0] == "group"
+                                             else f"Message {key[1]}")
+            if self.root.focus_get() is not self.entry:
+                self.entry.insert(0, self._entry_placeholder_text)
+                self.entry.config(fg=DIM)
+                self._entry_has_placeholder = True
+
+        # Group members-only hint
+        if key and key[0] == "group" and self.name in self.groups.get(key[1], []):
+            self.group_hint.pack(side="bottom", fill="x")
+        else:
+            self.group_hint.pack_forget()
 
         # offline notice bar
         if key and key[0] == "pm" and not allowed:
@@ -846,18 +904,13 @@ class ChatClient:
         for m in members:
             r = tk.Frame(self.member_list.content, bg=PANEL, padx=px(8), pady=px(5))
             r.pack(fill="x")
-            avatar(r, m, 26).pack(side="left", padx=(0, px(6)))
-            col = tk.Frame(r, bg=PANEL)
-            col.pack(side="left", fill="x", expand=True)
-            you = " (you)" if m == self.name else ""
-            label(col, m + you, 10).pack(anchor="w")
-            if m == owner:
-                tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
-                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
+            avatar(r, m, 26).pack(side="left", padx=(0, px(4)))
+            online = m in self.users
+            dot = tk.Canvas(r, width=px(8), height=px(8), bg=PANEL, highlightthickness=0)
+            dot.create_oval(0, 0, px(8), px(8), fill=ONLINE if online else DIM, outline="")
+            dot.pack(side="left", padx=(0, px(6)))
+            # Right badges (pack before col so they claim space first)
             is_timed_out = (m in timeouts and now < timeouts[m])
-            if is_timed_out:
-                tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
-                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
             if is_owner and m != self.name:
                 btn_txt = "Manage" if is_timed_out else "Timeout"
                 btn = tk.Button(r, text=btn_txt,
@@ -866,6 +919,20 @@ class ChatClient:
                                 activebackground=LINE, activeforeground=TEXT,
                                 font=(FONT, 8, "bold"), padx=px(6), pady=px(2))
                 btn.pack(side="right")
+            if is_timed_out:
+                tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
+                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
+            if m == self.name:
+                tk.Label(r, text="YOU", bg=PANEL, fg=DIM,
+                         font=(FONT, 9)).pack(side="right", padx=(px(4), 0))
+            elif m == owner:
+                tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
+                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
+            col = tk.Frame(r, bg=PANEL)
+            col.pack(side="left", fill="x", expand=True)
+            label(col, m, 10, bold=True).pack(anchor="w")
+            label(col, "Online" if online else "Offline", 9,
+                  ONLINE if online else DIM).pack(anchor="w")
             self.member_list.bind_controls(r)
 
         # About section (members only)
@@ -873,9 +940,12 @@ class ChatClient:
             tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8), pady=(px(8), 0))
             about = tk.Frame(self.members_panel, bg=PANEL, padx=px(12), pady=px(8))
             about.pack(fill="x")
-            label(about, "About", 9, MUTED, bold=True).pack(anchor="w")
+            label(about, "About this group", 9, DIM, bold=True).pack(anchor="w")
             label(about, f"#{g}", 10).pack(anchor="w", pady=(px(4), 0))
-            label(about, "Your membership — Joined", 9, DIM).pack(anchor="w", pady=(px(2), 0))
+            mem_row = tk.Frame(about, bg=PANEL)
+            mem_row.pack(fill="x", pady=(px(6), 0))
+            label(mem_row, "Your membership", 9, MUTED).pack(side="left")
+            label(mem_row, "Joined", 9, ONLINE).pack(side="right")
 
     def open_timeout_dialog(self, target):
         if not self.active or self.active[0] != "group":
@@ -1010,6 +1080,8 @@ class ChatClient:
 
     def send_text(self, _event=None):
         if self.pending_ai and self.pending_ai['action']=='draft' and self.pending_ai['room']==self.active:
+            return
+        if getattr(self, '_entry_has_placeholder', False):
             return
         text = self.entry.get().strip()
         if not text or not self.can_send(self.active):
