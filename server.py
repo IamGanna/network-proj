@@ -407,6 +407,23 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                         save_state()
                         broadcast_state(failed)
 
+                elif kind == "delete_group":
+                    g = msg["group"]
+                    if g not in groups:
+                        send(session, {"type": "error", "text": f"Group '{g}' does not exist"}, failed)
+                    elif group_creators.get(g) != name:
+                        send(session, {"type": "error", "text": "Only the group owner can delete the group"}, failed)
+                    else:
+                        del groups[g]
+                        group_members.pop(g, None)
+                        group_creators.pop(g, None)
+                        group_timeouts.pop(g, None)
+                        for sess in clients.values():
+                            sess.history.forget_room(('group', g))
+                        activity.forget(("group", g))
+                        save_state()
+                        broadcast_state(failed)
+
                 elif kind == "join_group":  # R10: a client only ever adds itself
                     g = msg.get("group")
                     if g not in groups:

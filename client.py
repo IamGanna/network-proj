@@ -1045,6 +1045,9 @@ class ChatClient:
             mem_row.pack(fill="x", pady=(px(6), 0))
             label(mem_row, "Your membership", 9, MUTED).pack(side="left")
             label(mem_row, "Joined", 9, ONLINE).pack(side="right")
+            if is_owner:
+                button(about, "Delete Group", lambda grp=g: self.delete_group(grp),
+                       bg="#3A2320").pack(fill="x", pady=(px(10), 0))
 
     def open_timeout_dialog(self, target):
         if not self.active or self.active[0] != "group":
@@ -1120,6 +1123,9 @@ class ChatClient:
             return
         self.want = ("group", g)
         self.core.join_group(g)  # room opens when server confirms membership
+
+    def delete_group(self, g):
+        self.core.delete_group(g)
 
     def create_group(self):
         dlg = tk.Toplevel(self.root, bg=PANEL, padx=px(24), pady=px(20))

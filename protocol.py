@@ -94,6 +94,7 @@ CLIENT_FIELDS = {
     'file_start': ('file_id', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
     'file_chunk': ('file_id', 'chunk', 'data'),
     'timeout_member': ('group', 'target', 'duration'),
+    'delete_group': ('group',),
     'stt_chunk': ('stt_id', 'chunk', 'chunks', 'data'),  # one piece of a WAV recording to transcribe
 }
 SERVER_FIELDS = {

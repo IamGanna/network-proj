@@ -263,3 +263,6 @@ class ChatCore:
 
     def timeout_member(self, group, target, duration):
         return self.send({"type": "timeout_member", "group": group, "target": target, "duration": str(duration)})
+
+    def delete_group(self, group):
+        return self.send({"type": "delete_group", "group": group})
