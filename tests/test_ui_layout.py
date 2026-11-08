@@ -205,7 +205,79 @@ def test_ai_draft_hint_updates(tmp_path):
         c.select(("group", "g"))
         c._update_ai_hint()
         assert "Auto-generate" in c.draft_button.cget("text")
+        c._entry_focus_in()  # focusing the box clears the placeholder, as when a user types
         c.entry.insert(0, "hello")
         c._update_ai_hint()
         assert "Rewrite" in c.draft_button.cget("text")
+        break
+
+
+# ---- Text-to-speech regression ----
+
+def test_auto_speak_reads_incoming_pm_and_group_messages(tmp_path):
+    """With the speaker on, other people's PM and group messages are spoken; our own are not."""
+    import voice
+    for c, root in make_client("Tara"):
+        c.stt_id = None
+        c.recording = False
+        c.closed = False
+        c.auto_speak = False
+        c.users = ["Tara", "Bob"]
+        c.groups = {"g": ["Tara", "Bob"]}
+        spoken = []
+        with patch.object(voice, "speak", side_effect=spoken.append), patch.object(voice, "stop"):
+            c.handle({"type": "pm", "from": "Bob", "to": "Tara", "text": "silent pm"})
+            c.handle({"type": "group_msg", "group": "g", "from": "Bob", "text": "silent group"})
+            assert spoken == []
+            c._toggle_speak()
+            c.handle({"type": "pm", "from": "Bob", "to": "Tara", "text": "pm"})
+            c.handle({"type": "pm", "from": "Tara", "to": "Bob", "text": "my pm"})
+            c.handle({"type": "group_msg", "group": "g", "from": "Bob", "text": "group"})
+            c.handle({"type": "group_msg", "group": "g", "from": "Tara", "text": "my group"})
+        assert spoken == ["pm", "group"]
+        break
+
+
+# ---- Placeholder must not swallow speech / AI draft text ----
+
+def _placeholder_client(c):
+    c.stt_id = None
+    c.recording = False
+    c.closed = False
+    c.auto_speak = False
+    c.users = ["Tara", "Bob"]
+    c.core.pm.return_value = True
+    c.select(("pm", "Bob"))
+    assert c._entry_has_placeholder and c.entry.get() == "Message Bob"
+
+
+def test_speech_result_replaces_placeholder_and_can_be_sent(tmp_path):
+    for c, root in make_client("Tara"):
+        _placeholder_client(c)
+        c.stt_id = "s1"
+        c.handle({"type": "stt_text", "stt_id": "s1", "text": "hello"})
+        assert c.entry.get() == "hello"
+        assert not c._entry_has_placeholder
+        c.send_text()
+        c.core.pm.assert_called_once_with("Bob", "hello")
+        break
+
+
+def test_ai_draft_replaces_placeholder_and_can_be_sent(tmp_path):
+    for c, root in make_client("Tara"):
+        _placeholder_client(c)
+        c._replace_draft(("pm", "Bob"), "AI reply")
+        assert c.entry.get() == "AI reply"
+        assert not c._entry_has_placeholder
+        c.send_text()
+        c.core.pm.assert_called_once_with("Bob", "AI reply")
+        break
+
+
+def test_placeholder_is_not_treated_as_typed_text_by_ai_menu(tmp_path):
+    for c, root in make_client("Tara"):
+        _placeholder_client(c)
+        c._update_ai_hint()
+        assert c.draft_button["text"].endswith("Auto-generate reply")
+        assert c._composer_text() == ""
         break
