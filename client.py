@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
 
 from chat_core import ChatCore
 from protocol import validate_server_event, AI_MAX_INSTRUCTION, MAX_SPEECH_BYTES
@@ -42,10 +42,14 @@ def px(n):
     return round(n * SCALE)
 
 
-BG, PANEL, RAISED, LINE = "#0E1014", "#171A20", "#262A33", "#2E333D"
-TEXT, MUTED, DIM = "#ECEAE5", "#A7ADB8", "#8A909C"
-ACCENT, ON_ACCENT, ERROR, ONLINE = "#F2A65A", "#1A1206", "#FF9B8A", "#5FD39A"
-PALETTE = ["#8FB4FF", "#7FD1AE", "#E58FB8", "#D7C27A", "#B9A3FF", "#7FC8D1"]
+BG, PANEL, CHAT_BG, MEMBER_BG = "#101012", "#151517", "#1B1B1E", "#171719"
+RAISED, LINE = "#27272C", "#2B2B30"
+TEXT, MUTED, DIM = "#EEEEF0", "#AAAAB5", "#9696A3"
+ACCENT, ON_ACCENT, ERROR, ONLINE = "#FD771E", "#281C14", "#FF9B8A", "#78B99C"
+FOCUS = "#849FE0"
+SELECTED_BG, SELECTED_TEXT, SELECTED_META = "#241E19", "#EB8342", "#B7A08E"
+HEADER_HEIGHT = 64
+PALETTE = ["#9EB2C8", "#9AB8A4", "#C5A2B6", "#C7B18D", "#AAA1C5", "#8EADB8"]
 FONT = "Segoe UI"
 
 
@@ -63,7 +67,8 @@ def button(parent, text, command, primary=False, bg=RAISED, padx=14, pady=8):
 
 def entry(parent):
     return tk.Entry(parent, bg=BG, fg=TEXT, insertbackground=TEXT, relief="flat", font=(FONT, 11),
-                    highlightthickness=px(1), highlightbackground=LINE, highlightcolor=ACCENT)
+                    disabledbackground=BG, disabledforeground=DIM,
+                    highlightthickness=px(1), highlightbackground=LINE, highlightcolor=FOCUS)
 
 
 def label(parent, text, size=11, fg=TEXT, bold=False, **kw):
@@ -79,23 +84,73 @@ def avatar(parent, name, size=28):
     return c
 
 
+def pane_header(parent, bg):
+    header = tk.Frame(parent, bg=bg, height=px(HEADER_HEIGHT))
+    header.pack(fill="x")
+    header.pack_propagate(False)
+    tk.Frame(header, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
+    return header
+
+
+def workspace_accent(parent):
+    width, height = px(46), px(HEADER_HEIGHT)
+    strip = tk.Canvas(parent, width=width, height=height, bg=PANEL, highlightthickness=0)
+    for x in range(width):
+        strength = x / max(1, width - 1)
+        rib = 0.82 if (x // max(1, px(3))) % 2 else 1
+        r = 21 + round(39 * strength * rib)
+        g = 21 + round(19 * strength * rib)
+        b = 23 + round(3 * strength * rib)
+        strip.create_line(x, 0, x, height, fill=f"#{r:02x}{g:02x}{b:02x}")
+    strip.pack(side="right", fill="y")
+
+
+def campfire_mark(parent):
+    tile = tk.Canvas(parent, width=px(34), height=px(34), bg=ACCENT, highlightthickness=0)
+    # Draw the brand mark independently of the platform's emoji font.
+    flame = (17, 6, 21, 14, 24, 11, 25, 20, 22, 26, 17, 28, 12, 26, 9, 21, 10, 16, 13, 18)
+    tile.create_polygon(*(px(value) for value in flame), fill=ON_ACCENT, smooth=True)
+    tile.pack(pady=px(14))
+
+
 class ScrollList(tk.Frame):
     """A bounded list whose wheel and navigation bindings stay local to it."""
     def __init__(self, parent):
-        super().__init__(parent, bg=PANEL)
-        self.canvas = tk.Canvas(self, bg=PANEL, highlightthickness=0, takefocus=1)
-        self.vertical = tk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        horizontal = tk.Scrollbar(self, orient="horizontal", command=self.canvas.xview)
-        self.canvas.configure(yscrollcommand=self.vertical.set, xscrollcommand=horizontal.set)
-        self.vertical.pack(side="right", fill="y")
-        horizontal.pack(side="bottom", fill="x")
+        surface = parent["bg"]
+        super().__init__(parent, bg=surface)
+        self.canvas = tk.Canvas(self, bg=surface, highlightthickness=0, takefocus=1)
+        style = ttk.Style(self)
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+        for axis in ("Vertical", "Horizontal"):
+            name = f"Campfire.{axis}.TScrollbar"
+            style.configure(name, background="#414147", troughcolor=MEMBER_BG,
+                            arrowcolor=MUTED, lightcolor="#414147", darkcolor="#414147",
+                            bordercolor=MEMBER_BG, borderwidth=0, arrowsize=px(8))
+            style.map(name, background=[("active", "#505057"), ("!active", "#414147")])
+        self.vertical = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview,
+                                      style="Campfire.Vertical.TScrollbar")
+        horizontal = ttk.Scrollbar(self, orient="horizontal", command=self.canvas.xview,
+                                   style="Campfire.Horizontal.TScrollbar")
+        self.canvas.configure(
+            yscrollcommand=lambda first, last: self._set_scrollbar(self.vertical, first, last, "right", "y"),
+            xscrollcommand=lambda first, last: self._set_scrollbar(horizontal, first, last, "bottom", "x"),
+        )
         self.canvas.pack(side="left", fill="both", expand=True)
-        self.content = tk.Frame(self.canvas, bg=PANEL)
+        self.content = tk.Frame(self.canvas, bg=surface)
         self.window = self.canvas.create_window(0, 0, anchor="nw", window=self.content)
         self.content.bind("<Configure>", self._layout)
         self.canvas.bind("<Configure>", self._layout)
         self.bind_controls(self.canvas)
         self.bind_controls(self.content)
+
+    def _set_scrollbar(self, scrollbar, first, last, side, fill):
+        scrollbar.set(first, last)
+        overflow = float(first) > 0 or float(last) < 1
+        if overflow and not scrollbar.winfo_manager():
+            scrollbar.pack(side=side, fill=fill, before=self.canvas)
+        elif not overflow and scrollbar.winfo_manager():
+            scrollbar.pack_forget()
 
     def _layout(self, _event=None):
         self.canvas.itemconfigure(self.window, width=max(self.canvas.winfo_width(), self.content.winfo_reqwidth()))
@@ -186,8 +241,8 @@ class ChatClient:
                         highlightthickness=px(1), highlightbackground=RAISED)
         card.place(relx=0.5, rely=0.5, anchor="center", width=px(420))
         label(card, "Campfire", 13, ACCENT, bold=True).pack(anchor="w")
-        label(card, "Pull up a seat", 22, bold=True).pack(anchor="w", pady=(px(16), px(4)))
-        label(card, "Pick a name to join. Everyone online sees it, so it has to be yours alone.",
+        label(card, "Join the workspace", 22, bold=True).pack(anchor="w", pady=(px(16), px(4)))
+        label(card, "Choose the display name people will see in chat.",
               10, MUTED, wraplength=px(350), justify="left").pack(anchor="w")
         label(card, f"Server  {HOST}:{PORT}", 9, DIM).pack(anchor="w", pady=(px(16), 0))
         label(card, "Your name", 10, "#C9CDD4", bold=True).pack(anchor="w", pady=(px(12), px(6)))
@@ -276,8 +331,7 @@ class ChatClient:
         icon_bar = tk.Frame(main, bg=BG, width=px(48))
         icon_bar.pack(side="left", fill="y")
         icon_bar.pack_propagate(False)
-        tk.Label(icon_bar, text="🔥", bg=ACCENT, font=(FONT, 15),
-                 padx=px(6), pady=px(5), cursor="hand2").pack(pady=px(14))
+        campfire_mark(icon_bar)
 
         # Column 2 — sidebar (220px)
         side = tk.Frame(main, bg=PANEL, width=px(220))
@@ -286,10 +340,12 @@ class ChatClient:
         tk.Frame(main, bg=LINE, width=px(1)).pack(side="left", fill="y")
 
         # Sidebar header
-        hdr = tk.Frame(side, bg=PANEL, padx=px(12), pady=px(14))
-        hdr.pack(fill="x")
-        label(hdr, "Campfire", 13, bold=True).pack(anchor="w")
-        self.workspace_sub = label(hdr, "Network Project · 0 online", 9, ONLINE)
+        hdr = pane_header(side, PANEL)
+        workspace_accent(hdr)
+        identity = tk.Frame(hdr, bg=PANEL)
+        identity.pack(side="left", padx=(px(12), 0))
+        label(identity, "Campfire", 13, bold=True).pack(anchor="w")
+        self.workspace_sub = label(identity, "Network Project · 0 online", 9, MUTED)
         self.workspace_sub.pack(anchor="w")
 
         # Sidebar lists
@@ -314,40 +370,33 @@ class ChatClient:
         self.user_box = self.user_list.content
 
         # Sidebar me-strip (bottom)
-        me = tk.Frame(side, bg=RAISED, padx=px(10), pady=px(8))
+        me = tk.Frame(side, bg=BG, padx=px(10), pady=px(8))
         me.pack(side="bottom", fill="x")
         tk.Frame(side, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
         avatar(me, self.name, 28).pack(side="left")
-        tk.Label(me, text="⚙", bg=RAISED, fg=MUTED, font=(FONT, 14), cursor="hand2").pack(side="right")
-        info = tk.Frame(me, bg=RAISED)
+        info = tk.Frame(me, bg=BG)
         info.pack(side="left", padx=px(8))
         label(info, self.name, 10, bold=True).pack(anchor="w")
         label(info, "● Online", 9, ONLINE).pack(anchor="w")
 
         # Column 3 — chat area (flex)
-        self.center = tk.Frame(main, bg=PANEL)
+        self.center = tk.Frame(main, bg=CHAT_BG)
         self.center.pack(side="left", fill="both", expand=True)
         tk.Frame(main, bg=LINE, width=px(1)).pack(side="left", fill="y")
 
         # Column 4 — members panel (200px, always packed)
-        self.members_panel = tk.Frame(main, bg=PANEL, width=px(200))
+        self.members_panel = tk.Frame(main, bg=MEMBER_BG, width=px(200))
         self.members_panel.pack(side="left", fill="y")
         self.members_panel.pack_propagate(False)
 
         # Chat header
-        chat_hdr = tk.Frame(self.center, bg=PANEL, padx=px(16), pady=px(12))
-        chat_hdr.pack(fill="x")
-        name_row = tk.Frame(chat_hdr, bg=PANEL)
-        name_row.pack(fill="x")
+        chat_hdr = pane_header(self.center, CHAT_BG)
+        name_row = tk.Frame(chat_hdr, bg=CHAT_BG)
+        name_row.pack(fill="x", expand=True, padx=px(16))
         self.hash_label = label(name_row, "", 15, MUTED)
         self.hash_label.pack(side="left")
-        self.title = label(name_row, f"Welcome, {self.name}", 15, bold=True)
-        self.title.pack(side="left")
-        for _icon in ("ℹ", "👥", "🔍"):
-            tk.Button(name_row, text=_icon, bg=PANEL, fg=MUTED, relief="flat", bd=0,
-                      font=(FONT, 12), padx=px(4), pady=0, cursor="hand2",
-                      activebackground=RAISED, activeforeground=TEXT).pack(side="right", padx=px(2))
-        tk.Frame(self.center, bg=LINE, height=px(1)).pack(fill="x")
+        self.title = label(name_row, f"Welcome, {self.name}", 13, bold=True, anchor="w")
+        self.title.pack(side="left", fill="x", expand=True)
 
         # Persistent error/offline bars
         self.error_bar = tk.Label(self.center, bg="#3A2320", fg=ERROR, font=(FONT, 10),
@@ -356,13 +405,14 @@ class ChatClient:
                                     padx=px(16), pady=px(5), anchor="w")
 
         # Composer (bottom)
-        composer = tk.Frame(self.center, bg=PANEL, padx=px(16), pady=px(12))
+        composer = tk.Frame(self.center, bg=CHAT_BG, padx=px(16), pady=px(12))
         composer.pack(side="bottom", fill="x")
         tk.Frame(self.center, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
-        self.group_hint = tk.Label(self.center, bg=PANEL, fg=DIM, font=(FONT, 10),
+        self.group_hint = tk.Label(self.center, bg=CHAT_BG, fg=DIM, font=(FONT, 9),
                                     padx=px(24), pady=px(4), anchor="w",
                                     text="Only group members can view this channel.")
         self.entry = entry(composer)
+        self.entry.config(width=1)
         self.entry.pack(side="left", fill="x", expand=True, ipady=px(8))
         self.entry.bind("<Return>", self.send_text)
         self._entry_has_placeholder = False
@@ -370,9 +420,12 @@ class ChatClient:
         self.entry.bind("<FocusIn>", self._entry_focus_in, add="+")
         self.entry.bind("<FocusOut>", self._entry_focus_out, add="+")
 
-        self.send_button = button(composer, "Send ➤", self.send_text, primary=True)
+        self.send_button = button(composer, "Send", self.send_text)
         self.send_button.pack(side="right", padx=(px(8), 0))
-        self.ai_btn = button(composer, "✨ AI", self._toggle_ai_menu, bg=RAISED, padx=10, pady=8)
+        self.composer_text = tk.StringVar(master=composer)
+        self.entry.config(textvariable=self.composer_text)
+        self.composer_text.trace_add("write", self._style_send)
+        self.ai_btn = button(composer, "AI", self._toggle_ai_menu, bg=RAISED, padx=10, pady=8)
         self.ai_btn.pack(side="right", padx=(px(4), 0))
         self.file_button = button(composer, "📎", self.choose_file, bg=RAISED, padx=10, pady=8)
         self.file_button.pack(side="right", padx=(px(4), 0))
@@ -398,13 +451,13 @@ class ChatClient:
         self._ai_popover_visible = False
 
         # Stage (chat messages area)
-        self.stage = tk.Frame(self.center, bg=PANEL)
+        self.stage = tk.Frame(self.center, bg=CHAT_BG)
         self.stage.pack(fill="both", expand=True)
         self.empty = label(self.stage, "Pick a group or someone to start chatting.", 11, MUTED)
         self.empty.place(relwidth=1, relheight=1)
 
         # Preview card (shown for non-member group view)
-        self.preview = tk.Frame(self.stage, bg=PANEL)
+        self.preview = tk.Frame(self.stage, bg=CHAT_BG)
         self.preview.place(relwidth=1, relheight=1)
         preview_card = tk.Frame(self.preview, bg=RAISED, padx=px(24), pady=px(20))
         preview_card.place(relx=0.5, rely=0.4, anchor="center")
@@ -417,12 +470,13 @@ class ChatClient:
 
     def open_room(self, key):
         if key not in self.rooms:
-            box = tk.Text(self.stage, bg=PANEL, fg=TEXT, relief="flat", wrap="word",
+            box = tk.Text(self.stage, bg=CHAT_BG, fg=TEXT, relief="flat", wrap="word",
                           padx=px(20), pady=px(16), font=(FONT, 11), state="disabled",
                           cursor="arrow", highlightthickness=0)
             box.tag_config("time", foreground=DIM, font=(FONT, 9))
-            box.tag_config("body", foreground="#DCDAD5", spacing1=px(2))
-            box.tag_config("grouped", foreground="#DCDAD5",
+            box.tag_config("body", foreground=TEXT, spacing1=px(2),
+                           lmargin1=px(48), lmargin2=px(48))
+            box.tag_config("grouped", foreground=TEXT,
                            lmargin1=px(48), lmargin2=px(48))
             box.tag_config("datesep", justify="center", foreground=DIM, font=(FONT, 9),
                            spacing1=px(8), spacing3=px(4))
@@ -455,7 +509,7 @@ class ChatClient:
             elif sender == self.name:
                 fg = ACCENT
             else:
-                fg = color_for(sender)
+                fg = TEXT
             name_tag = "name:" + sender
             box.tag_config(name_tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(14))
             av = avatar(box, sender, 36)
@@ -518,6 +572,7 @@ class ChatClient:
             self.entry.delete(0, "end")
             self.entry.config(fg=TEXT)
             self._entry_has_placeholder = False
+            self._style_send()
 
     def _entry_focus_out(self, _event=None):
         if not getattr(self, '_entry_has_placeholder', False) and not self.entry.get():
@@ -526,6 +581,16 @@ class ChatClient:
                 self.entry.insert(0, pt)
                 self.entry.config(fg=DIM)
                 self._entry_has_placeholder = True
+                self._style_send()
+
+    def _style_send(self, *_):
+        ready = (self.send_button["state"] == "normal"
+                 and not self._entry_has_placeholder and bool(self.composer_text.get().strip()))
+        self.send_button.config(bg=ACCENT if ready else RAISED,
+                                fg=ON_ACCENT if ready else MUTED,
+                                activebackground="#FF934D" if ready else LINE,
+                                activeforeground=ON_ACCENT if ready else TEXT,
+                                disabledforeground=DIM)
 
     def select(self, key):
         if key and key[0] == "group" and key[1] not in self.groups:
@@ -566,7 +631,7 @@ class ChatClient:
 
         # offline notice bar
         if key and key[0] == "pm" and not allowed:
-            self.offline_bar.config(text=f"{key[1]} is offline — messages will be delivered when they reconnect.")
+            self.offline_bar.config(text=f"{key[1]} is offline. You can still read this conversation.")
             self.offline_bar.pack(fill="x", before=self.stage)
         else:
             self.offline_bar.pack_forget()
@@ -600,6 +665,7 @@ class ChatClient:
                       and self.pending_ai['room'] == self.active)
         self.entry.config(state='normal' if allowed and not frozen else 'disabled')
         self.send_button.config(state='normal' if allowed and not frozen else 'disabled')
+        self._style_send()
         self.file_button.config(state='normal' if allowed else 'disabled')
         writing = self.ai_send_worker is not None and self.ai_send_worker.is_alive()
         state = 'normal' if allowed and self.pending_ai is None and not writing and self.instruction_dialog is None else 'disabled'
@@ -782,7 +848,8 @@ class ChatClient:
 
     def row(self, parent, text, command, key=None, badge="", person=None):
         n = self.unread.get(key)
-        bg = RAISED if key and key == self.active else PANEL
+        selected = key is not None and key == self.active
+        bg = SELECTED_BG if selected else PANEL
         row = tk.Frame(parent, bg=bg, padx=px(8), pady=px(4))
         row.pack(fill="x", pady=px(1))
         if person:
@@ -790,13 +857,15 @@ class ChatClient:
         if n:
             tk.Label(row, text=f" {n} ", bg=ACCENT, fg=ON_ACCENT, font=(FONT, 9, "bold")).pack(side="right")
         elif badge:
-            label(row, badge, 9, ACCENT if badge == "Join" else DIM, bold=badge == "Join").pack(side="right")
+            label(row, badge, 9, SELECTED_META if selected else DIM).pack(side="right")
         tk.Button(row, text=text, command=command, anchor="w", relief="flat", bd=0, cursor="hand2",
-                  bg=bg, fg=TEXT if bg == RAISED or n else MUTED, activebackground=LINE, activeforeground=TEXT,
+                  bg=bg, fg=SELECTED_TEXT if selected else TEXT if n else MUTED,
+                  activebackground=bg if selected else LINE, activeforeground=SELECTED_TEXT if selected else TEXT,
                   font=(FONT, 11, "bold" if n else "normal"), padx=px(6), pady=px(4)).pack(side="left", fill="x", expand=True)
 
     def _dm_row(self, parent, name, key):
-        bg = RAISED if key == self.active else PANEL
+        selected = key == self.active
+        bg = SELECTED_BG if selected else PANEL
         row = tk.Frame(parent, bg=bg, padx=px(8), pady=px(4))
         row.pack(fill="x", pady=px(1))
         avatar(row, name, 26).pack(side="left", padx=(0, px(6)))
@@ -809,10 +878,11 @@ class ChatClient:
             tk.Label(row, text=f" {n} ", bg=ACCENT, fg=ON_ACCENT,
                      font=(FONT, 9, "bold")).pack(side="right")
         display = name + (" (you)" if name == self.name else "")
-        color = TEXT if key == self.active or n else (MUTED if online else DIM)
+        color = SELECTED_TEXT if selected else TEXT if n else MUTED if online else DIM
         tk.Button(row, text=display, command=lambda: self.select(key),
                   anchor="w", relief="flat", bd=0, cursor="hand2",
-                  bg=bg, fg=color, activebackground=LINE, activeforeground=TEXT,
+                  bg=bg, fg=color, activebackground=bg if selected else LINE,
+                  activeforeground=SELECTED_TEXT if selected else TEXT,
                   font=(FONT, 11, "bold" if n else "normal"),
                   padx=px(4), pady=px(3)).pack(side="left", fill="x", expand=True)
         return row
@@ -847,27 +917,30 @@ class ChatClient:
             for child in area.content.winfo_children():
                 area.bind_controls(child)
 
+    def _members_heading(self, text):
+        heading = label(self.members_panel, text, 10, TEXT, bold=True, anchor="w", padx=px(14))
+        padding = max(0, px(HEADER_HEIGHT) - px(1) - heading.winfo_reqheight())
+        heading.pack(fill="x", pady=(padding // 2, padding - padding // 2))
+        tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x")
+
     def render_members(self):
         for w in self.members_panel.winfo_children():
             w.destroy()
 
         if not self.active:
-            label(self.members_panel, "MEMBERS", 9, MUTED, bold=True).pack(
-                anchor="w", padx=px(12), pady=(px(16), px(4)))
+            self._members_heading("MEMBERS")
             label(self.members_panel, f"{len(self.users)} online", 9, DIM).pack(
-                anchor="w", padx=px(12))
+                anchor="w", padx=px(14), pady=px(10))
             return
 
         kind, name = self.active
 
         if kind == "pm":
-            label(self.members_panel, "CONVERSATION", 9, MUTED, bold=True).pack(
-                anchor="w", padx=px(12), pady=(px(16), px(4)))
-            tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8))
-            r = tk.Frame(self.members_panel, bg=PANEL, padx=px(10), pady=px(8))
+            self._members_heading("CONVERSATION")
+            r = tk.Frame(self.members_panel, bg=MEMBER_BG, padx=px(12), pady=px(12))
             r.pack(fill="x")
             avatar(r, name, 28).pack(side="left", padx=(0, px(8)))
-            col = tk.Frame(r, bg=PANEL)
+            col = tk.Frame(r, bg=MEMBER_BG)
             col.pack(side="left")
             label(col, name, 10, bold=True).pack(anchor="w")
             online = name in self.users
@@ -890,17 +963,15 @@ class ChatClient:
                 if m == self.name:
                     self.my_timeouts.pop(g, None)
 
-        label(self.members_panel, f"MEMBERS — {len(members)}", 9, MUTED, bold=True).pack(
-            anchor="w", padx=px(12), pady=(px(16), px(4)))
-        tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8))
+        self._members_heading(f"MEMBERS — {len(members)}")
         self.member_list = ScrollList(self.members_panel)
         self.member_list.pack(fill="both", expand=True)
         for m in members:
-            r = tk.Frame(self.member_list.content, bg=PANEL, padx=px(8), pady=px(5))
+            r = tk.Frame(self.member_list.content, bg=MEMBER_BG, padx=px(8), pady=px(5))
             r.pack(fill="x")
             avatar(r, m, 26).pack(side="left", padx=(0, px(4)))
             online = m in self.users
-            dot = tk.Canvas(r, width=px(8), height=px(8), bg=PANEL, highlightthickness=0)
+            dot = tk.Canvas(r, width=px(8), height=px(8), bg=MEMBER_BG, highlightthickness=0)
             dot.create_oval(0, 0, px(8), px(8), fill=ONLINE if online else DIM, outline="")
             dot.pack(side="left", padx=(0, px(6)))
             # Right badges (pack before col so they claim space first)
@@ -917,12 +988,12 @@ class ChatClient:
                 tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
                          font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
             if m == self.name:
-                tk.Label(r, text="YOU", bg=PANEL, fg=DIM,
+                tk.Label(r, text="YOU", bg=MEMBER_BG, fg=DIM,
                          font=(FONT, 9)).pack(side="right", padx=(px(4), 0))
             elif m == owner:
                 tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
                          font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
-            col = tk.Frame(r, bg=PANEL)
+            col = tk.Frame(r, bg=MEMBER_BG)
             col.pack(side="left", fill="x", expand=True)
             label(col, m, 10, bold=True).pack(anchor="w")
             label(col, "Online" if online else "Offline", 9,
@@ -932,11 +1003,11 @@ class ChatClient:
         # About section (members only)
         if self.name in members:
             tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8), pady=(px(8), 0))
-            about = tk.Frame(self.members_panel, bg=PANEL, padx=px(12), pady=px(8))
+            about = tk.Frame(self.members_panel, bg=MEMBER_BG, padx=px(12), pady=px(8))
             about.pack(fill="x")
             label(about, "About this group", 9, DIM, bold=True).pack(anchor="w")
             label(about, f"#{g}", 10).pack(anchor="w", pady=(px(4), 0))
-            mem_row = tk.Frame(about, bg=PANEL)
+            mem_row = tk.Frame(about, bg=MEMBER_BG)
             mem_row.pack(fill="x", pady=(px(6), 0))
             label(mem_row, "Your membership", 9, MUTED).pack(side="left")
             label(mem_row, "Joined", 9, ONLINE).pack(side="right")
