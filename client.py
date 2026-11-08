@@ -567,6 +567,18 @@ class ChatClient:
             return True
         return False
 
+    def _composer_text(self):
+        """What the user actually typed; the greyed placeholder does not count."""
+        return "" if getattr(self, '_entry_has_placeholder', False) else self.entry.get()
+
+    def _clear_placeholder(self):
+        """Drop the greyed placeholder before real text (speech, AI draft) goes into the box."""
+        if getattr(self, '_entry_has_placeholder', False):
+            self.entry.config(state="normal")
+            self.entry.delete(0, "end")
+            self.entry.config(fg=TEXT)
+            self._entry_has_placeholder = False
+
     def _entry_focus_in(self, _event=None):
         if getattr(self, '_entry_has_placeholder', False):
             self.entry.delete(0, "end")
@@ -686,7 +698,7 @@ class ChatClient:
             self._ai_popover_visible = True
 
     def _update_ai_hint(self):
-        if self.entry.get():
+        if self._composer_text():
             self.draft_button.config(text="✏️ Rewrite my message")
         else:
             self.draft_button.config(text="✏️ Auto-generate reply")
@@ -704,7 +716,7 @@ class ChatClient:
         if action not in ('summary', 'draft') or len(instruction) > AI_MAX_INSTRUCTION:
             self.flash('AI instruction must be at most 500 characters.')
             return False
-        original = self.entry.get() if room == self.active else self.drafts.get(room, '')
+        original = self._composer_text() if room == self.active else self.drafts.get(room, '')
         self.drafts[room] = original
         pending = dict(request_id=uuid.uuid4().hex, room=room, action=action,
                        original_draft=original, timer=None)
@@ -746,6 +758,7 @@ class ChatClient:
     def _replace_draft(self, room, text):
         self.drafts[room] = text
         if self.active == room:
+            self._clear_placeholder()
             self.entry.config(state='normal')
             self.entry.delete(0, 'end')
             self.entry.insert(0, text)
@@ -888,6 +901,17 @@ class ChatClient:
         return row
 
     def render_sidebar(self):
+        # Rebuilding creates fresh native buttons that flash white for a few frames on Windows,
+        # so only rebuild when something the rows show has changed.
+        sig = (self.name, self.active, tuple((g, tuple(m)) for g, m in self.groups.items()),
+               tuple(self.users), tuple(k for k in self.rooms if k[0] == "pm"),
+               tuple(sorted((k, v) for k, v in self.unread.items() if v)))
+        if sig == getattr(self, "_sidebar_sig", None) and self.group_box.winfo_children():
+            return
+        self._sidebar_sig = sig
+        self._build_sidebar()
+
+    def _build_sidebar(self):
         for box in (self.group_box, self.user_box):
             for w in box.winfo_children():
                 w.destroy()
@@ -924,6 +948,16 @@ class ChatClient:
         tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x")
 
     def render_members(self):
+        now = time.time()
+        g = self.active[1] if self.active and self.active[0] == "group" else None
+        live = frozenset(m for m, exp in self.group_timeouts.get(g, {}).items() if now < exp)
+        sig = (self.name, self.active, tuple(self.users), tuple(self.groups.get(g, ())) if g else (), live)
+        if sig == getattr(self, "_members_sig", None) and self.members_panel.winfo_children():
+            return
+        self._members_sig = sig
+        self._build_members()
+
+    def _build_members(self):
         for w in self.members_panel.winfo_children():
             w.destroy()
 
@@ -1368,6 +1402,8 @@ class ChatClient:
         elif kind == "group_msg":
             if self.name in self.groups.get(msg["group"], []):
                 self.show(("group", msg["group"]), msg["from"], msg["text"])
+                if self.auto_speak and msg["from"] != self.name:
+                    voice.speak(msg["text"])
         elif kind == "file_start":
             file_id = msg["file_id"]
             sender = msg["from"]
@@ -1430,6 +1466,7 @@ class ChatClient:
             if kind == "stt_error":
                 self.flash(f"STT error: {msg['text']}")
             elif msg["text"] and self.entry["state"] == "normal":
+                self._clear_placeholder()
                 self.entry.insert("end", (" " + msg["text"]) if self.entry.get() else msg["text"])
         elif kind == "error":
             self.want = None
