@@ -14,18 +14,13 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
 
-try:
-    from PIL import Image, ImageTk
-    HAS_PIL = True
-except ImportError:
-    HAS_PIL = False
-
 from chat_core import ChatCore
 from protocol import validate_server_event, AI_MAX_INSTRUCTION
 try:
     import voice
-except ImportError:
-    voice = None
+    from PIL import Image, ImageTk
+except ImportError as e:
+    raise SystemExit(f"Missing package '{e.name}'. Run: pip install -r requirements.txt")
 
 _env = Path(__file__).parent / ".env"
 if _env.exists():
@@ -850,7 +845,7 @@ class ChatClient:
         self.auto_speak = not self.auto_speak
         self.speak_btn.config(bg=ACCENT if self.auto_speak else RAISED,
                               fg=ON_ACCENT if self.auto_speak else TEXT)
-        if not self.auto_speak and voice:
+        if not self.auto_speak:
             voice.stop()
 
     def send_text(self, _event=None):
@@ -920,14 +915,13 @@ class ChatClient:
         return f"{n} B"
 
     def create_image_thumbnail(self, filename, raw_bytes):
-        if HAS_PIL:
-            try:
-                import io
-                pil_im = Image.open(io.BytesIO(raw_bytes))
-                pil_im.thumbnail((360, 260))
-                return ImageTk.PhotoImage(pil_im)
-            except Exception:
-                pass
+        try:
+            import io
+            pil_im = Image.open(io.BytesIO(raw_bytes))
+            pil_im.thumbnail((360, 260))
+            return ImageTk.PhotoImage(pil_im)
+        except Exception:
+            pass
         if filename.lower().endswith((".png", ".gif")):
             try:
                 b64_str = base64.b64encode(raw_bytes).decode("ascii")
