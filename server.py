@@ -253,7 +253,6 @@ def disconnect_sessions(pending):
                 if not clients:
                     active_transfers.clear()
                 if not groups:
-                    group_creators.clear()
                     group_timeouts.clear()
                 broadcast_state(pending)
             session.history.clear()
