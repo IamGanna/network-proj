@@ -25,12 +25,36 @@ from ai_runtime import AiRuntime
 HOST, PORT = "0.0.0.0", 5000  # 0.0.0.0 = accept connections from other computers on the LAN
 
 clients = {}  # name -> Session
-groups = {}   # group name -> list of member names
+groups = {}   # group name -> list of online member names
+group_members = {}  # group name -> set of all member names (persisted across restarts)
 active_transfers = {}  # file_id -> transfer metadata
 group_creators = {}  # group name -> creator name
 group_timeouts = {}  # group name -> {target_member_name: expiry_timestamp}
 stt_key = ""  # TYPHOON_API_KEY from the server .env, set in main(); empty turns speech-to-text off
 lock = threading.Lock()  # guards state, recipient selection and outbound enqueue order
+
+STATE_FILE = "server_state.json"
+
+
+def save_state():
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({
+                "group_members": {g: list(m) for g, m in group_members.items()},
+                "group_creators": group_creators,
+            }, f)
+    except OSError:
+        pass
+
+
+def load_state():
+    try:
+        with open(STATE_FILE) as f:
+            data = json.load(f)
+        group_members.update({g: set(m) for g, m in data.get("group_members", {}).items()})
+        group_creators.update(data.get("group_creators", {}))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
 
 def encode(msg):
@@ -281,7 +305,6 @@ def disconnect_sessions(pending):
                             del groups[group]
                             for other in clients.values():
                                 other.history.forget_room(('group', group))
-                            group_creators.pop(group, None)
                             group_timeouts.pop(group, None)
                             activity.forget(("group", group))
                         elif group_creators.get(group) == name:
@@ -289,7 +312,6 @@ def disconnect_sessions(pending):
                 if not clients:
                     active_transfers.clear()
                 if not groups:
-                    group_creators.clear()
                     group_timeouts.clear()
                 broadcast_state(pending)
             session.history.clear()
@@ -344,6 +366,13 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                     else:
                         session.name = name = new
                         clients[name] = session
+                        for g, members in group_members.items():
+                            if name in members:
+                                if g not in groups:
+                                    groups[g] = []
+                                    group_timeouts[g] = {}
+                                if name not in groups[g]:
+                                    groups[g].append(name)
                         send(session, {"type": "login_ok", "name": name}, failed)
                         broadcast_state(failed)
 
@@ -372,8 +401,10 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                         send(session, {"type": "error", "text": "State limit reached"}, failed)
                     else:
                         groups[g] = [name]
+                        group_members[g] = {name}
                         group_creators[g] = name
                         group_timeouts[g] = {}
+                        save_state()
                         broadcast_state(failed)
 
                 elif kind == "join_group":  # R10: a client only ever adds itself
@@ -386,6 +417,8 @@ def handle(conn, addr, *, session=None, accepted_at=None, login_timeout=LOGIN_TI
                             send(session, {"type": "error", "text": "State limit reached"}, failed)
                         else:
                             groups[g].append(name)
+                            group_members.setdefault(g, set()).add(name)
+                            save_state()
                             broadcast_state(failed)
                             if g in group_timeouts and name in group_timeouts[g]:
                                 exp = group_timeouts[g][name]
@@ -677,6 +710,7 @@ def serve(listener, stop=None, *, max_sessions=MAX_SESSIONS,
 def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     port = int(sys.argv[1]) if len(sys.argv) > 1 else PORT
+    load_state()
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # IPv4 + TCP
     if os.name != "nt":  # on Windows this option lets two servers share one port with no error
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
