@@ -166,6 +166,7 @@ class ChatClient:
         self.group_timeouts = {}  # group -> {member: expiry_timestamp}
         self.my_timeouts = {}     # group -> expiry_timestamp
         self.rooms = {}  # ("pm", name) or ("group", name) -> its chat window (R5, R6)
+        self.room_last_msg = {}  # {key: (sender, timestamp)} for grouping
         self.unread = {}
         self.drafts = {}  # exact composer text keyed by room identity
         self.active = None
@@ -275,109 +276,177 @@ class ChatClient:
     # ---------- UI ----------
     def build_ui(self):
         main = tk.Frame(self.root, bg=BG)
-        main.pack(fill="both", expand=True, padx=px(8), pady=px(8))
+        main.pack(fill="both", expand=True)
 
-        side = tk.Frame(main, bg=PANEL, width=px(250), padx=px(12), pady=px(16))
+        # Column 1 — icon bar (48px)
+        icon_bar = tk.Frame(main, bg=BG, width=px(48))
+        icon_bar.pack(side="left", fill="y")
+        icon_bar.pack_propagate(False)
+        tk.Label(icon_bar, text="🔥", bg=BG, font=(FONT, 18)).pack(pady=px(14))
+
+        # Column 2 — sidebar (220px)
+        side = tk.Frame(main, bg=PANEL, width=px(220))
         side.pack(side="left", fill="y")
         side.pack_propagate(False)
-        label(side, "Campfire", 14, bold=True).pack(anchor="w", padx=px(6))
-        me = tk.Frame(side, bg=BG, padx=px(10), pady=px(10))
-        me.pack(side="bottom", fill="x")
-        avatar(me, self.name, 32).pack(side="left")
-        info = tk.Frame(me, bg=BG)
-        info.pack(side="left", padx=px(10))
-        label(info, self.name, 10, bold=True).pack(anchor="w")
-        label(info, "Connected", 9, ONLINE).pack(anchor="w")
+        tk.Frame(main, bg=LINE, width=px(1)).pack(side="left", fill="y")
+
+        # Sidebar header
+        hdr = tk.Frame(side, bg=PANEL, padx=px(12), pady=px(14))
+        hdr.pack(fill="x")
+        label(hdr, "Campfire", 13, bold=True).pack(anchor="w")
+        self.workspace_sub = label(hdr, "Network Project · 0 online", 9, MUTED)
+        self.workspace_sub.pack(anchor="w")
+
+        # Sidebar lists
         lists = tk.Frame(side, bg=PANEL)
         lists.pack(fill="both", expand=True)
         lists.grid_rowconfigure(1, weight=1, uniform="lists")
         lists.grid_rowconfigure(3, weight=1, uniform="lists")
         lists.grid_columnconfigure(0, weight=1)
-        head = tk.Frame(lists, bg=PANEL)
-        head.grid(row=0, column=0, sticky="ew", pady=(px(20), px(4)))
-        label(head, "GROUPS", 9, MUTED, bold=True).pack(side="left", padx=px(6))
-        button(head, "+", self.create_group, bg=PANEL, padx=10, pady=0).pack(side="right")
+
+        grp_head = tk.Frame(lists, bg=PANEL)
+        grp_head.grid(row=0, column=0, sticky="ew", padx=px(12), pady=(px(16), px(4)))
+        label(grp_head, "GROUPS", 9, MUTED, bold=True).pack(side="left")
+        button(grp_head, "+", self.create_group, bg=PANEL, padx=8, pady=0).pack(side="right")
         self.group_list = ScrollList(lists)
         self.group_list.grid(row=1, column=0, sticky="nsew")
         self.group_box = self.group_list.content
-        self.online_label = label(lists, "ONLINE", 9, MUTED, bold=True)
-        self.online_label.grid(row=2, column=0, sticky="w", padx=px(6), pady=(px(20), px(4)))
+
+        self.dm_label = label(lists, "DIRECT MESSAGES · 0 online", 9, MUTED, bold=True)
+        self.dm_label.grid(row=2, column=0, sticky="w", padx=px(12), pady=(px(16), px(4)))
         self.user_list = ScrollList(lists)
         self.user_list.grid(row=3, column=0, sticky="nsew")
-        self.user_box = self.user_list.content  # online users (R4)
+        self.user_box = self.user_list.content
 
+        # Sidebar me-strip (bottom)
+        me = tk.Frame(side, bg=RAISED, padx=px(10), pady=px(8))
+        me.pack(side="bottom", fill="x")
+        tk.Frame(side, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
+        avatar(me, self.name, 28).pack(side="left")
+        info = tk.Frame(me, bg=RAISED)
+        info.pack(side="left", padx=px(8))
+        label(info, self.name, 10, bold=True).pack(anchor="w")
+        label(info, "● Online", 9, ONLINE).pack(anchor="w")
+
+        # Column 3 — chat area (flex)
         self.center = tk.Frame(main, bg=PANEL)
-        self.center.pack(side="left", fill="both", expand=True, padx=(px(8), 0))
-        self.members_panel = tk.Frame(main, bg=PANEL, width=px(210), padx=px(12), pady=px(16))  # group members (R9)
+        self.center.pack(side="left", fill="both", expand=True)
+        tk.Frame(main, bg=LINE, width=px(1)).pack(side="left", fill="y")
+
+        # Column 4 — members panel (200px, always packed)
+        self.members_panel = tk.Frame(main, bg=PANEL, width=px(200))
+        self.members_panel.pack(side="left", fill="y")
         self.members_panel.pack_propagate(False)
 
-        header = tk.Frame(self.center, bg=PANEL, padx=px(24), pady=px(14))
-        header.pack(fill="x")
-        self.title = label(header, "", 15, bold=True)
-        self.title.pack(anchor="w")
-        self.subtitle = label(header, "", 9, DIM)
-        self.subtitle.pack(anchor="w")
-        self.join_button = button(header, "Join group", self.join_selected, primary=True)
-        tk.Frame(self.center, bg=RAISED, height=px(1)).pack(fill="x")
+        # Chat header
+        chat_hdr = tk.Frame(self.center, bg=PANEL, padx=px(16), pady=px(12))
+        chat_hdr.pack(fill="x")
+        name_row = tk.Frame(chat_hdr, bg=PANEL)
+        name_row.pack(fill="x")
+        self.hash_label = label(name_row, "", 15, MUTED)
+        self.hash_label.pack(side="left")
+        self.title = label(name_row, f"Welcome, {self.name}", 15, bold=True)
+        self.title.pack(side="left")
+        tk.Frame(self.center, bg=LINE, height=px(1)).pack(fill="x")
+
+        # Persistent error/offline bars
         self.error_bar = tk.Label(self.center, bg="#3A2320", fg=ERROR, font=(FONT, 10),
-                                  padx=px(24), pady=px(8), anchor="w")
-        composer = tk.Frame(self.center, bg=PANEL, padx=px(24), pady=px(16))
+                                  padx=px(16), pady=px(6), anchor="w")
+        self.offline_bar = tk.Label(self.center, bg=RAISED, fg=MUTED, font=(FONT, 9),
+                                    padx=px(16), pady=px(5), anchor="w")
+
+        # Composer (bottom)
+        composer = tk.Frame(self.center, bg=PANEL, padx=px(16), pady=px(12))
         composer.pack(side="bottom", fill="x")
-        self.entry = entry(composer)  # chat box (R6)
-        self.entry.pack(side="left", fill="x", expand=True, ipady=px(10))
+        tk.Frame(self.center, bg=LINE, height=px(1)).pack(side="bottom", fill="x")
+        self.entry = entry(composer)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=px(8))
         self.entry.bind("<Return>", self.send_text)
-        self.file_button = button(composer, "📎 File", self.choose_file, bg=RAISED, padx=10, pady=8)
-        self.file_button.pack(side="right", padx=(px(8), 0))
-        self.send_button = button(composer, "Send", self.send_text, primary=True)
+        self.send_button = button(composer, "Send ➤", self.send_text, primary=True)
         self.send_button.pack(side="right", padx=(px(8), 0))
+        self.ai_btn = button(composer, "✨ AI", self._toggle_ai_menu, bg=RAISED, padx=10, pady=8)
+        self.ai_btn.pack(side="right", padx=(px(4), 0))
+        self.file_button = button(composer, "📎", self.choose_file, bg=RAISED, padx=10, pady=8)
+        self.file_button.pack(side="right", padx=(px(4), 0))
         self.speak_btn = button(composer, "🔊", self._toggle_speak, bg=RAISED, padx=10, pady=8)
         self.speak_btn.pack(side="right", padx=(px(4), 0))
         self.mic_btn = button(composer, "🎤", self._toggle_mic, bg=RAISED, padx=10, pady=8)
         self.mic_btn.pack(side="right", padx=(px(4), 0))
-        ai_row = tk.Frame(self.center, bg=PANEL, padx=px(24), pady=px(6))
-        ai_row.pack(side='bottom', fill='x')
-        self.summary_button = button(ai_row, 'Summarize', lambda: self.start_ai('summary'), pady=6)
-        self.summary_button.pack(side='left')
-        self.draft_button = button(ai_row, 'Draft reply', self.draft_reply, pady=6)
-        self.draft_button.pack(side='left', padx=px(8))
-        self.ai_status = label(ai_row, '', 9, DIM, wraplength=px(260), justify='left')
-        self.ai_status.pack(side='left', fill='x', expand=True)
-        self.ai_disclosure = label(self.center, 'AI sends this chat’s session messages to OpenRouter and its model provider.',
-                                   9, DIM, wraplength=px(500), justify='left')
-        self.ai_disclosure.pack(side='bottom', anchor='w', padx=px(24))
+
+        # AI popover (packed above composer, hidden by default)
+        self._ai_popover = tk.Frame(self.center, bg=RAISED, padx=px(12), pady=px(10))
+        self.summary_button = button(self._ai_popover, "📋 Summarize",
+                                     lambda: self.start_ai("summary"), pady=6)
+        self.summary_button.pack(anchor="w")
+        self.draft_button = button(self._ai_popover, "✏️ Auto-generate reply",
+                                   self.draft_reply, pady=6)
+        self.draft_button.pack(anchor="w", pady=(px(4), 0))
+        self.ai_status = label(self._ai_popover, "", 9, DIM, wraplength=px(260), justify="left")
+        self.ai_status.pack(anchor="w", pady=(px(4), 0))
+        self.ai_disclosure = label(self._ai_popover,
+                                   "AI sends this chat’s session messages to OpenRouter and its model provider.",
+                                   9, DIM, wraplength=px(260), justify="left")
+        self.ai_disclosure.pack(anchor="w", pady=(px(2), 0))
+        self._ai_popover_visible = False
+
+        # Stage (chat messages area)
         self.stage = tk.Frame(self.center, bg=PANEL)
         self.stage.pack(fill="both", expand=True)
-        self.empty = label(self.stage, "Pick a group or someone online to start chatting.", 11, MUTED)
+        self.empty = label(self.stage, "Pick a group or someone to start chatting.", 11, MUTED)
         self.empty.place(relwidth=1, relheight=1)
-        self.preview = label(self.stage, "Group preview · Join to see messages and chat.", 11, MUTED)
+
+        # Preview card (shown for non-member group view)
+        self.preview = tk.Frame(self.stage, bg=PANEL)
         self.preview.place(relwidth=1, relheight=1)
+        preview_card = tk.Frame(self.preview, bg=RAISED, padx=px(24), pady=px(20))
+        preview_card.place(relx=0.5, rely=0.4, anchor="center")
+        label(preview_card, "Public preview", 13, bold=True).pack(anchor="w")
+        label(preview_card, "You have not joined this group.", 10, MUTED).pack(anchor="w", pady=(px(4), px(12)))
+        self.join_button = button(preview_card, "Join group", self.join_selected, primary=True)
+        self.join_button.pack(anchor="w")
+
         self.select(None)
 
     def open_room(self, key):
         if key not in self.rooms:
-            box = tk.Text(self.stage, bg=PANEL, fg=TEXT, relief="flat", wrap="word", padx=px(24), pady=px(16),
-                          font=(FONT, 11), state="disabled", cursor="arrow", highlightthickness=0)
+            box = tk.Text(self.stage, bg=PANEL, fg=TEXT, relief="flat", wrap="word",
+                          padx=px(20), pady=px(16), font=(FONT, 11), state="disabled",
+                          cursor="arrow", highlightthickness=0)
             box.tag_config("time", foreground=DIM, font=(FONT, 9))
-            box.tag_config("body", foreground="#DCDAD5")
+            box.tag_config("body", foreground="#DCDAD5", spacing1=px(2))
+            box.tag_config("grouped", foreground="#DCDAD5",
+                           lmargin1=px(48), lmargin2=px(48))
             box.place(relwidth=1, relheight=1)
             self.rooms[key] = box
             visible = (self.preview if self.active and self.active[0] == "group"
                        and not self.can_send(self.active) else self.rooms.get(self.active, self.empty))
-            visible.tkraise()  # a new window stacks on top; keep the active view visible
+            visible.tkraise()
         return self.rooms[key]
 
     def show(self, key, sender, text):
         box = self.open_room(key)
-        tag = "name:" + sender
-        if sender == "[System]":
-            fg = "#FF9B8A"
-        elif sender == self.name:
-            fg = ACCENT
-        else:
-            fg = color_for(sender)
-        box.tag_config(tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(12))  # gap above each message, not below every line
+        now = time.time()
+        last_sender, last_time = self.room_last_msg.get(key, (None, 0))
+        grouped = (sender == last_sender and now - last_time < 300)
+        self.room_last_msg[key] = (sender, now)
+
         box.configure(state="normal")
-        box.insert("end", sender, (tag,), "  " + time.strftime("%H:%M") + "\n", "time", text + "\n", "body")
+        if grouped:
+            box.insert("end", text + "\n", "grouped")
+        else:
+            if sender == "[System]":
+                fg = "#FF9B8A"
+            elif sender == self.name:
+                fg = ACCENT
+            else:
+                fg = color_for(sender)
+            name_tag = "name:" + sender
+            box.tag_config(name_tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(14))
+            av = avatar(box, sender, 36)
+            box.window_create("end", window=av)
+            box.insert("end", " " + sender, (name_tag,),
+                       "  " + time.strftime("%H:%M") + "\n", "time",
+                       text + "\n", "body")
         box.configure(state="disabled")
         box.see("end")
         if key != self.active:
@@ -419,7 +488,7 @@ class ChatClient:
             return False
         kind, name = key
         if kind == "pm":
-            return True
+            return name in self.users  # offline users can't receive
         if kind == "group":
             if self.name not in self.groups.get(name, []):
                 return False
@@ -434,37 +503,41 @@ class ChatClient:
         if self.active is not None:
             self.drafts[self.active] = self.entry.get()
         self.active = key
-        self.join_button.pack_forget()
         allowed = self.can_send(key)
+
         self.entry.config(state="normal")
         self.entry.delete(0, "end")
         if key is not None:
             self.entry.insert(0, self.drafts.get(key, ""))
         self.entry.config(state="normal" if allowed else "disabled")
         self.send_button.config(state="normal" if allowed else "disabled")
+
+        # offline notice bar
+        if key and key[0] == "pm" and not allowed:
+            self.offline_bar.config(text=f"{key[1]} is offline — messages will be delivered when they reconnect.")
+            self.offline_bar.pack(fill="x", before=self.stage)
+        else:
+            self.offline_bar.pack_forget()
+
         if key is None:
+            self.hash_label.config(text="")
             self.title.config(text=f"Welcome, {self.name}")
-            self.subtitle.config(text="Groups and people online are on the left.")
             self.empty.tkraise()
         else:
             kind, name = key
-            self.title.config(text=("#  " if kind == "group" else "@  ") + name)
+            self.hash_label.config(text="# " if kind == "group" else "")
+            self.title.config(text=name)
             if kind == "group" and not allowed:
                 if self.name not in self.groups.get(name, []):
-                    self.subtitle.config(text="Public membership preview · You have not joined")
                     self.preview.tkraise()
-                    self.join_button.pack(anchor="w", pady=(px(6), 0))
                 else:
                     self.unread.pop(key, None)
                     self.open_room(key).tkraise()
-                    rem = max(1, int(self.my_timeouts.get(name, time.time()) - time.time()))
-                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
             else:
                 self.unread.pop(key, None)
                 self.open_room(key).tkraise()
-                self.subtitle.config(text="Only members see these messages" if kind == "group"
-                                     else f"Private: only you and {name} see this")
                 self.entry.focus_set()
+
         self.render_sidebar()
         self.render_members()
         self.refresh_ai_controls()
@@ -482,6 +555,23 @@ class ChatClient:
         self.draft_button.config(state=state)
         self.ai_status.config(text=('Generating ' + ('summary' if self.pending_ai['action']=='summary' else 'reply')
                                    + ' for ' + self.pending_ai['room'][1] + '…') if self.pending_ai else '')
+        if self.pending_ai is not None and self._ai_popover_visible:
+            self._toggle_ai_menu()
+
+    def _toggle_ai_menu(self):
+        if self._ai_popover_visible:
+            self._ai_popover.pack_forget()
+            self._ai_popover_visible = False
+        else:
+            self._update_ai_hint()
+            self._ai_popover.pack(side="bottom", fill="x", before=self.stage)
+            self._ai_popover_visible = True
+
+    def _update_ai_hint(self):
+        if self.entry.get():
+            self.draft_button.config(text="✏️ Rewrite my message")
+        else:
+            self.draft_button.config(text="✏️ Auto-generate reply")
 
     def start_ai(self, action, instruction='', *, room=None):
         room = self.active if room is None else room
@@ -653,28 +743,54 @@ class ChatClient:
                   bg=bg, fg=TEXT if bg == RAISED or n else MUTED, activebackground=LINE, activeforeground=TEXT,
                   font=(FONT, 11, "bold" if n else "normal"), padx=px(6), pady=px(4)).pack(side="left", fill="x", expand=True)
 
+    def _dm_row(self, parent, name, key):
+        bg = RAISED if key == self.active else PANEL
+        row = tk.Frame(parent, bg=bg, padx=px(8), pady=px(4))
+        row.pack(fill="x", pady=px(1))
+        avatar(row, name, 26).pack(side="left", padx=(0, px(6)))
+        online = name in self.users
+        dot = tk.Canvas(row, width=px(8), height=px(8), bg=bg, highlightthickness=0)
+        dot.create_oval(0, 0, px(8), px(8), fill=ONLINE if online else DIM, outline="")
+        dot.pack(side="left", padx=(0, px(6)))
+        n = self.unread.get(key)
+        if n:
+            tk.Label(row, text=f" {n} ", bg=ACCENT, fg=ON_ACCENT,
+                     font=(FONT, 9, "bold")).pack(side="right")
+        display = name + (" (you)" if name == self.name else "")
+        color = TEXT if key == self.active or n else (MUTED if online else DIM)
+        tk.Button(row, text=display, command=lambda: self.select(key),
+                  anchor="w", relief="flat", bd=0, cursor="hand2",
+                  bg=bg, fg=color, activebackground=LINE, activeforeground=TEXT,
+                  font=(FONT, 11, "bold" if n else "normal"),
+                  padx=px(4), pady=px(3)).pack(side="left", fill="x", expand=True)
+        return row
+
     def render_sidebar(self):
         for box in (self.group_box, self.user_box):
             for w in box.winfo_children():
                 w.destroy()
         for g, members in self.groups.items():
             key = ("group", g)
-            if self.name in members:
-                self.row(self.group_box, "#  " + g, lambda k=key: self.select(k), key, str(len(members)))
-            else:
-                self.row(self.group_box, "#  " + g, lambda k=key: self.select(k), key, badge="Preview")
+            badge = str(len(members)) if self.name in members else "Preview"
+            self.row(self.group_box, "#  " + g, lambda k=key: self.select(k), key, badge)
         if not self.groups:
             label(self.group_box, "No groups yet. Press + to start one.", 9, DIM).pack(anchor="w", padx=px(6))
-        self.online_label.config(text=f"ONLINE · {len(self.users)}")
+
+        online_count = len([u for u in self.users if u != self.name])
+        self.dm_label.config(text=f"DIRECT MESSAGES · {online_count} online")
+        self.workspace_sub.config(text=f"Network Project · {len(self.users)} online")
+
+        seen = set()
         for u in self.users:
             key = ("pm", u)
-            display_name = u + " (you)" if u == self.name else u
-            self.row(self.user_box, display_name, lambda k=key: self.select(k), key, person=u)
-        for kind, u in self.rooms:
-            if kind == "pm" and u not in self.users:
-                self.row(self.user_box, u, lambda k=("pm", u): self.select(k), ("pm", u), "offline", u)
+            seen.add(u)
+            self._dm_row(self.user_box, u, key)
+        for kind, u in list(self.rooms):
+            if kind == "pm" and u not in seen:
+                self._dm_row(self.user_box, u, ("pm", u))
         if not self.users:
             label(self.user_box, "No one is online yet.", 9, DIM).pack(anchor="w", padx=px(6))
+
         for area in (self.group_list, self.user_list):
             for child in area.content.winfo_children():
                 area.bind_controls(child)
@@ -682,10 +798,35 @@ class ChatClient:
     def render_members(self):
         for w in self.members_panel.winfo_children():
             w.destroy()
-        if not self.active or self.active[0] != "group" or self.active[1] not in self.groups:
-            self.members_panel.pack_forget()
+
+        if not self.active:
+            label(self.members_panel, "MEMBERS", 9, MUTED, bold=True).pack(
+                anchor="w", padx=px(12), pady=(px(16), px(4)))
+            label(self.members_panel, f"{len(self.users)} online", 9, DIM).pack(
+                anchor="w", padx=px(12))
             return
-        g = self.active[1]
+
+        kind, name = self.active
+
+        if kind == "pm":
+            label(self.members_panel, "CONVERSATION", 9, MUTED, bold=True).pack(
+                anchor="w", padx=px(12), pady=(px(16), px(4)))
+            tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8))
+            r = tk.Frame(self.members_panel, bg=PANEL, padx=px(10), pady=px(8))
+            r.pack(fill="x")
+            avatar(r, name, 28).pack(side="left", padx=(0, px(8)))
+            col = tk.Frame(r, bg=PANEL)
+            col.pack(side="left")
+            label(col, name, 10, bold=True).pack(anchor="w")
+            online = name in self.users
+            label(col, "● Online" if online else "● Offline", 9,
+                  ONLINE if online else DIM).pack(anchor="w")
+            return
+
+        # group state
+        if name not in self.groups:
+            return
+        g = name
         members = self.groups[g]
         owner = members[0] if members else None
         is_owner = (self.name == owner)
@@ -697,30 +838,44 @@ class ChatClient:
                 if m == self.name:
                     self.my_timeouts.pop(g, None)
 
-        label(self.members_panel, f"MEMBERS · {len(members)}", 9, MUTED, bold=True).pack(anchor="w", pady=(0, px(8)))
+        label(self.members_panel, f"MEMBERS — {len(members)}", 9, MUTED, bold=True).pack(
+            anchor="w", padx=px(12), pady=(px(16), px(4)))
+        tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8))
         self.member_list = ScrollList(self.members_panel)
         self.member_list.pack(fill="both", expand=True)
         for m in members:
-            r = tk.Frame(self.member_list.content, bg=PANEL, pady=px(5))
+            r = tk.Frame(self.member_list.content, bg=PANEL, padx=px(8), pady=px(5))
             r.pack(fill="x")
-            avatar(r, m).pack(side="left", padx=(0, px(8)))
-            label(r, m + (" (you)" if m == self.name else ""), 10).pack(side="left")
+            avatar(r, m, 26).pack(side="left", padx=(0, px(6)))
+            col = tk.Frame(r, bg=PANEL)
+            col.pack(side="left", fill="x", expand=True)
+            you = " (you)" if m == self.name else ""
+            label(col, m + you, 10).pack(anchor="w")
             if m == owner:
                 tk.Label(r, text=" Owner ", bg="#2E2818", fg="#D7C27A",
-                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
             is_timed_out = (m in timeouts and now < timeouts[m])
             if is_timed_out:
                 tk.Label(r, text=" Timed out ", bg="#3A2320", fg=ERROR,
-                         font=(FONT, 8, "bold")).pack(side="left", padx=(px(4), 0))
+                         font=(FONT, 8, "bold")).pack(side="right", padx=(px(4), 0))
             if is_owner and m != self.name:
                 btn_txt = "Manage" if is_timed_out else "Timeout"
-                btn = tk.Button(r, text=btn_txt, command=lambda target=m: self.open_timeout_dialog(target),
+                btn = tk.Button(r, text=btn_txt,
+                                command=lambda target=m: self.open_timeout_dialog(target),
                                 relief="flat", bd=0, cursor="hand2", bg=RAISED, fg=TEXT,
                                 activebackground=LINE, activeforeground=TEXT,
                                 font=(FONT, 8, "bold"), padx=px(6), pady=px(2))
                 btn.pack(side="right")
             self.member_list.bind_controls(r)
-        self.members_panel.pack(side="right", fill="y", padx=(px(8), 0), before=self.center)
+
+        # About section (members only)
+        if self.name in members:
+            tk.Frame(self.members_panel, bg=LINE, height=px(1)).pack(fill="x", padx=px(8), pady=(px(8), 0))
+            about = tk.Frame(self.members_panel, bg=PANEL, padx=px(12), pady=px(8))
+            about.pack(fill="x")
+            label(about, "About", 9, MUTED, bold=True).pack(anchor="w")
+            label(about, f"#{g}", 10).pack(anchor="w", pady=(px(4), 0))
+            label(about, "Your membership — Joined", 9, DIM).pack(anchor="w", pady=(px(2), 0))
 
     def open_timeout_dialog(self, target):
         if not self.active or self.active[0] != "group":
@@ -943,22 +1098,30 @@ class ChatClient:
 
     def show_file(self, key, sender, filename, filesize, file_id, raw_bytes=None):
         box = self.open_room(key)
-        tag = "name:" + sender
-        box.tag_config(tag, foreground=ACCENT if sender == self.name else color_for(sender), font=(FONT, 11, "bold"), spacing1=px(12))
+        now = time.time()
+        last_sender, last_time = self.room_last_msg.get(key, (None, 0))
+        grouped = (sender == last_sender and now - last_time < 300)
+        self.room_last_msg[key] = (sender, now)
+
         box.configure(state="normal")
-        box.insert("end", sender, tag, "  " + time.strftime("%H:%M") + "\n", "time")
+        if not grouped:
+            fg = ACCENT if sender == self.name else color_for(sender)
+            name_tag = "name:" + sender
+            box.tag_config(name_tag, foreground=fg, font=(FONT, 11, "bold"), spacing1=px(14))
+            av = avatar(box, sender, 36)
+            box.window_create("end", window=av)
+            box.insert("end", " " + sender, (name_tag,),
+                       "  " + time.strftime("%H:%M") + "\n", "time")
 
         card = tk.Frame(box, bg="#1B1F27", padx=px(14), pady=px(10),
                         highlightthickness=px(1), highlightbackground=LINE)
 
-        # Image preview for image files
         is_image = filename.lower().endswith((".png", ".gif", ".jpg", ".jpeg", ".webp", ".bmp"))
         if is_image and raw_bytes:
             img = self.create_image_thumbnail(filename, raw_bytes)
             if img:
                 self.file_photos.append(img)
-                img_lbl = tk.Label(card, image=img, bg="#1B1F27")
-                img_lbl.pack(anchor="w", pady=(0, px(8)))
+                tk.Label(card, image=img, bg="#1B1F27").pack(anchor="w", pady=(0, px(8)))
 
         info_row = tk.Frame(card, bg="#1B1F27")
         info_row.pack(fill="x")
@@ -966,7 +1129,6 @@ class ChatClient:
         label(info_row, icon + filename, 10, bold=True).pack(side="left")
         label(info_row, f" ({self.format_bytes(filesize)})", 9, MUTED).pack(side="left")
 
-        # Save button for recipient or when data is available
         data_to_save = raw_bytes or self.file_data_store.get(file_id)
         if data_to_save is not None:
             def save():
@@ -978,16 +1140,11 @@ class ChatClient:
                         self.flash(f"Saved {filename}")
                     except OSError as err:
                         self.flash(f"Save failed: {err}")
-            save_btn = button(card, "💾 Save file", save, bg=RAISED, padx=8, pady=4)
-            save_btn.pack(anchor="w", pady=(px(8), 0))
+            button(card, "💾 Save file", save, bg=RAISED, padx=8, pady=4).pack(
+                anchor="w", pady=(px(8), 0))
 
         box.window_create("end", window=card)
-        box.insert("end", "\n\n")
-        box.configure(state="disabled")
-        box.see("end")
-        if key != self.active:
-            self.unread[key] = self.unread.get(key, 0) + 1
-            self.render_sidebar()
+        box.insert("end", "\n\n", "grouped" if grouped else ())
         box.configure(state="disabled")
         box.see("end")
         if key != self.active:
@@ -1029,14 +1186,8 @@ class ChatClient:
         if active_group_had_expiry:
             self.render_members()
             self.refresh_ai_controls()
-            if self.name in self.groups.get(active_g, []):
-                self.subtitle.config(text="Only members see these messages")
             if self.can_send(self.active):
                 self.entry.focus_set()
-
-        if active_g and self.name in self.groups.get(active_g, []) and self.is_my_timeout_active(active_g):
-            rem = max(1, int(self.my_timeouts[active_g] - now))
-            self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
 
     def handle(self, msg):
         try:
@@ -1133,11 +1284,6 @@ class ChatClient:
                     self.my_timeouts[g] = exp
             if self.active and self.active == ("group", g):
                 self.refresh_ai_controls()
-                if self.name in self.groups.get(g, []) and self.is_my_timeout_active(g):
-                    rem = max(1, int(self.my_timeouts[g] - time.time()))
-                    self.subtitle.config(text=f"⏳ You are timed out in this group ({self.format_remaining(rem)} remaining)")
-                elif self.name in self.groups.get(g, []):
-                    self.subtitle.config(text="Only members see these messages")
             self.render_members()
         elif kind == "error":
             self.want = None

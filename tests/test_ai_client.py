@@ -104,10 +104,8 @@ class AiClientTests(unittest.TestCase):
         with patch.object(client.time, 'time', return_value=100):
             self.app.handle(dict(type='timeout_notice', group='G', target='Alice', seconds=10))
             self.assertEqual(str(self.app.file_button['state']), 'disabled')
-            self.assertIn('timed out', self.app.subtitle['text'])
         with patch.object(client.time, 'time', return_value=110):
             self.app.check_timeout_countdown()
-        self.assertEqual(self.app.subtitle['text'], 'Only members see these messages')
         self.assertEqual(str(self.app.file_button['state']), 'normal')
         self.assertEqual(str(self.app.entry['state']), 'disabled')
         self.assertEqual(str(self.app.send_button['state']), 'disabled')

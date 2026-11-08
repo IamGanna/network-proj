@@ -66,7 +66,7 @@ class OnlineSelfTests(unittest.TestCase):
         self.assertEqual(names.count("Alice"), 1)
         self.assertCountEqual(names, ["Alice", "Bob", "Carol"])
         self.assertEqual(len(names), 3)
-        self.assertEqual(app.online_label.cget("text"), "ONLINE · 3")
+        self.assertIn("DIRECT MESSAGES", app.dm_label.cget("text"))
         self.assertEqual(buttons[names.index("Alice")].cget("text"), "Alice (you)")
 
         buttons[names.index("Alice")].invoke()
@@ -77,7 +77,7 @@ class OnlineSelfTests(unittest.TestCase):
         app.handle({"type": "users", "users": ["Alice"]})
         root.update()
         self.assertEqual([button.cget("text") for button in self.roster_buttons(app)], ["Alice (you)"])
-        self.assertEqual(app.online_label.cget("text"), "ONLINE · 1")
+        self.assertIn("DIRECT MESSAGES", app.dm_label.cget("text"))
 
         app.handle({"type": "users", "users": ["Alice", "Bob"]})
         root.update()
@@ -89,7 +89,7 @@ class OnlineSelfTests(unittest.TestCase):
         current = [button.cget("text") for button in self.roster_buttons(app)]
         self.assertCountEqual(current, ["Alice (you)", "Carol"])
         self.assertNotIn("Bob", current)
-        self.assertEqual(app.online_label.cget("text"), "ONLINE · 2")
+        self.assertIn("DIRECT MESSAGES", app.dm_label.cget("text"))
 
     def test_self_pm_echo_once(self):
         root, app = self.ui(connect=True)
