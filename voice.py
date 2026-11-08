@@ -1,4 +1,4 @@
-"""TTS (edge-tts + pygame) and STT (sounddevice + Typhoon API)."""
+"""TTS (edge-tts + pygame) and microphone recording (sounddevice). The server does speech-to-text."""
 import asyncio
 import io
 import os
@@ -11,13 +11,11 @@ import wave
 import edge_tts
 import numpy as np
 import pygame
-import requests
 import sounddevice as sd
 
 _VOICE_TH = "th-TH-NiwatNeural"
 _VOICE_EN = "en-US-AriaNeural"
 _SR = 16000
-_TYPHOON_URL = "https://api.opentyphoon.ai/v1/audio/transcriptions"
 
 _stream = None
 _frames = []
@@ -89,48 +87,22 @@ def start_recording():
     _stream.start()
 
 
-def stop_recording(on_done):
-    """Stop recording, transcribe, call on_done(text, error) on a background thread."""
+def stop_recording():
+    """Stop the mic and return the recording as WAV bytes, or b"" if nothing was captured."""
     global _stream
     if _stream is None:
-        on_done("", None)
-        return
-
+        return b""
     _stream.stop()
     _stream.close()
     _stream = None
-
     with _frames_lock:
         frames = list(_frames)
-
-    def _transcribe():
-        try:
-            if not frames:
-                on_done("", None)
-                return
-            key = os.getenv("TYPHOON_API_KEY", "")
-            if not key:
-                on_done("", "TYPHOON_API_KEY is not set")
-                return
-            audio = np.concatenate(frames, axis=0)
-            buf = io.BytesIO()
-            with wave.open(buf, "wb") as w:
-                w.setnchannels(1)
-                w.setsampwidth(2)
-                w.setframerate(_SR)
-                w.writeframes(audio.tobytes())
-            buf.seek(0)
-            r = requests.post(
-                _TYPHOON_URL,
-                headers={"Authorization": f"Bearer {key}"},
-                files={"file": ("speech.wav", buf, "audio/wav")},
-                data={"model": "typhoon-asr-edge"},
-                timeout=15,
-            )
-            r.raise_for_status()
-            on_done(r.json().get("text", ""), None)
-        except Exception as e:
-            print(f"[voice] STT error: {e}")
-            on_done("", str(e))
-
-    threading.Thread(target=_transcribe, daemon=True).start()
+    if not frames:
+        return b""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(_SR)
+        w.writeframes(np.concatenate(frames, axis=0).tobytes())
+    return buf.getvalue()

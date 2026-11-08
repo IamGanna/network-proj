@@ -89,19 +89,25 @@ class AiConfig:
 
 
 def load_server_config(path=None, *, environ=None):
-    """Read just the server key from a simple .env; process environment wins.
+    """The OpenRouter key from the server .env, or None when AI is not configured."""
+    return AiConfig.from_env({'OPENROUTER_API_KEY': read_env_value('OPENROUTER_API_KEY', path, environ=environ)})
+
+
+def read_env_value(wanted, path=None, *, environ=None):
+    """Read one key from a simple .env beside server.py; process environment wins.
 
     Supports KEY=value, optional export, and single/double quoted values.
     No shell execution, interpolation, or mutation of the process environment.
+    Returns '' when the key or file is missing.
     """
     environ = os.environ if environ is None else environ
-    if 'OPENROUTER_API_KEY' in environ:
-        return AiConfig.from_env(environ)
+    if wanted in environ:
+        return environ[wanted].strip()
     path = Path(__file__).with_name('.env') if path is None else Path(path)
     try:
         source = path.read_text(encoding='utf-8-sig')
     except FileNotFoundError:
-        return None
+        return ''
     except (OSError, UnicodeError):
         raise AiFailure('unavailable') from None
     key = ''
@@ -110,7 +116,7 @@ def load_server_config(path=None, *, environ=None):
         if line.startswith('export '):
             line = line[7:].lstrip()
         name, separator, value = line.partition('=')
-        if not separator or name.strip() != 'OPENROUTER_API_KEY':
+        if not separator or name.strip() != wanted:
             continue
         value = value.strip()
         if value.startswith(('"', "'")):
@@ -121,7 +127,7 @@ def load_server_config(path=None, *, environ=None):
             key = value[1:end]
         else:
             key = value.split(' #', 1)[0].strip()
-    return AiConfig.from_env({'OPENROUTER_API_KEY': key})
+    return key.strip()
 
 
 class AiFailure(Exception):

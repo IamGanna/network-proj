@@ -16,6 +16,7 @@ MAX_SESSIONS = 32  # active plus pending logins
 MAX_GROUPS = 64
 OUTBOUND_QUEUE_FRAMES = 1024  # shortcut: about 1000 unpaced messages at once still drop a client, pace bigger bursts
 LOGIN_TIMEOUT = 10.0  # absolute server deadline from accept
+MAX_SPEECH_BYTES = 2_000_000  # about 60 s of the client's 16 kHz 16-bit mono WAV
 AI_MAX_MESSAGES = 512
 AI_MAX_HISTORY_BYTES = 262_144
 AI_MAX_INSTRUCTION = 500
@@ -93,6 +94,7 @@ CLIENT_FIELDS = {
     'file_start': ('file_id', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
     'file_chunk': ('file_id', 'chunk', 'data'),
     'timeout_member': ('group', 'target', 'duration'),
+    'stt_chunk': ('stt_id', 'chunk', 'chunks', 'data'),  # one piece of a WAV recording to transcribe
 }
 SERVER_FIELDS = {
     'login_ok': ('name',),
@@ -105,6 +107,8 @@ SERVER_FIELDS = {
     'file_start': ('file_id', 'from', 'target_type', 'target', 'filename', 'filesize', 'chunks'),
     'file_chunk': ('file_id', 'chunk', 'data'),
     'timeout_notice': ('group', 'target', 'seconds'),
+    'stt_text': ('stt_id', 'text'),  # only to the speaker; the client puts it in the message box
+    'stt_error': ('stt_id', 'text'),
 }
 
 
