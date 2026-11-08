@@ -12,6 +12,7 @@ class RoomDraftTests(unittest.TestCase):
         self.app.name = 'Alice'
         self.app.login_frame.destroy()
         self.app.build_ui()
+        self.app.handle({'type': 'users', 'users': ['Alice', 'Bob', 'Carol']})
         self.app.handle({'type': 'groups', 'groups': {'G': ['Alice'], 'Bob': ['Alice'], 'Preview': ['Bob']}})
         self.app.core.pm.return_value = True
         self.app.core.group_msg.return_value = True
@@ -102,6 +103,17 @@ class RoomDraftTests(unittest.TestCase):
         self.app.core.pm.return_value = True
         self.app.send_text()
         self.assertEqual(self.app.entry.get(), '')
+
+    def test_offline_peer_preserves_draft_until_online(self):
+        self.app.select(('pm', 'Bob'))
+        self.app.entry.insert(0, '  wait for Bob  ')
+        self.app.handle({'type': 'users', 'users': ['Alice']})
+        self.app.send_text()
+        self.app.core.pm.assert_not_called()
+        self.assertEqual(self.app.entry.get(), '  wait for Bob  ')
+        self.app.handle({'type': 'users', 'users': ['Alice', 'Bob']})
+        self.app.send_text()
+        self.app.core.pm.assert_called_once_with('Bob', 'wait for Bob')
         self.app.select(('pm', 'Bob'))
         self.assertEqual(self.app.entry.get(), '')
 
