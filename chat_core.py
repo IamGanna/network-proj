@@ -11,7 +11,7 @@ import socket
 import threading
 import time
 
-from protocol import FrameReader, encode_frame, validate_client_message, validate_server_event
+from protocol import FrameReader, enable_keepalive, encode_frame, validate_client_message, validate_server_event
 
 
 class ChatCore:
@@ -59,17 +59,23 @@ class ChatCore:
         if callback is not None:
             callback({"type": "disconnected"})
 
-    def send(self, msg):
-        """True means local transport acceptance, not recipient display."""
+    def send(self, msg, *, wait=.1):
+        """True means local transport acceptance, not recipient display.
+
+        wait: seconds to wait for another send (e.g. a file chunk) to finish; None waits as long as needed.
+        """
         try:
-            if any(not isinstance(value, str) or not value.strip() for value in msg.values()):
-                raise ValueError("Names and message text must be nonempty strings.")
             validate_client_message(msg)
+            if msg['type'] in ('pm', 'group_msg') and not msg['text'].strip():
+                raise ValueError('Message text must be nonempty.')
             data = encode_frame(msg)
         except (ValueError, TypeError) as exc:
             self._emit({"type": "error", "text": str(exc)})
             return False
-        with self._send_lock:
+        if not self._send_lock.acquire(timeout=-1 if wait is None else wait):
+            self._emit({'type':'error', 'text':'Another message is being sent. Try again.'})
+            return False
+        try:
             with self._state_lock:
                 sock = self.sock if self.name and not self._closed else None
             if sock is None:
@@ -83,6 +89,8 @@ class ChatCore:
                 self._notify_disconnected()
                 self._drop_transport(sock)
                 return False
+        finally:
+            self._send_lock.release()
 
     def login(self, name):
         """Blocking. Returns (True, name) or (False, error text). Call before start()."""
@@ -109,6 +117,7 @@ class ChatCore:
             if self.reader is None:
                 sock.settimeout(self.connect_timeout)
                 sock.connect((self.host, self.port))
+                enable_keepalive(sock)
                 with self._state_lock:
                     if self._closed or self.sock is not sock:
                         return False, "Login cancelled."
@@ -121,17 +130,16 @@ class ChatCore:
             if not line:
                 raise ConnectionError("The server closed the connection.")
             reply = validate_server_event(json.loads(line))
-            if reply["type"] != "login_ok":  # R3: name taken; same connection can retry.
+            if reply["type"] != "login_ok":  # R3: name taken. The next try reconnects, so the 10 s deadline cannot hit it.
+                self._drop_transport(sock)
                 return False, reply["text"]
-            if not isinstance(reply["name"], str) or not reply["name"]:
-                raise ValueError("Invalid login response")
             with self._state_lock:
                 if self._closed or self.sock is not sock:
                     return False, "Login cancelled."
                 self.name = reply["name"]
             sock.settimeout(None)  # Healthy logged-in clients may remain idle.
             return True, self.name
-        except (OSError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as exc:
+        except (OSError, OverflowError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as exc:
             if sock is not None:
                 self._drop_transport(sock)
             if self._closed:
@@ -188,6 +196,10 @@ class ChatCore:
     def join_group(self, group):
         return self.send({"type": "join_group", "group": group})
 
+    def request_ai(self, request_id, action, room_type, room, instruction=''):
+        return self.send(dict(type='ai_request', request_id=request_id, action=action,
+                              room_type=room_type, room=room, instruction=instruction))
+
     def send_file(self, target_type, target, filepath, file_id=None, progress_callback=None):
         """Send a file in chunks over socket. Runs synchronously in caller thread."""
         import base64
@@ -217,7 +229,7 @@ class ChatCore:
             "filesize": str(filesize),
             "chunks": str(total_chunks),
         }
-        if not self.send(start_msg):
+        if not self.send(start_msg, wait=None):
             return False
 
         with open(filepath, "rb") as f:
@@ -230,7 +242,7 @@ class ChatCore:
                     "chunk": str(index),
                     "data": b64,
                 }
-                if not self.send(chunk_msg):
+                if not self.send(chunk_msg, wait=None):
                     return False
                 if progress_callback:
                     progress_callback(index + 1, total_chunks)
